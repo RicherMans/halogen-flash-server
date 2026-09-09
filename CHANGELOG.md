@@ -1,5 +1,204 @@
 # Changelog
 
+## 0.5.6
+
+### Fixed
+
+- **`/health` said the speculative drafter was not loaded, on every build ever
+  shipped.** Reported by [@aic0d3r](https://github.com/aic0d3r) (#16), who
+  benchmarked four stacks on this hardware and noticed that
+  `drafter_weights_loaded` read `false` while their own measurements showed the
+  drafter working: 43.1 tokens per second drafted against 33.2 serial, with
+  drafted and serial output byte-identical on all ten prompts they tried.
+
+  The field is inherited from an engine that had a separate draft model, where
+  it meant that model's weights were present. This engine has no such model,
+  the MTP head is the drafter, and nothing ever set the field, so it reported a
+  hardcoded `false`. At least one public diagnosis had already misfired off it,
+  reading it as evidence that speculative decoding never loads.
+
+  It now reports whether the MTP head is ready, which is the question the name
+  asks. `shortlist_draft_head` stays `false` beside it and that is correct:
+  this build has no such head, and the fix for a field that lies is not to make
+  an honest neighbour lie the other way.
+
+- **The out-of-memory refusal at startup referred to one of our internal
+  documents.** If pinning the weights would have left the host short, the
+  server refused and explained why by citing a file nobody outside this
+  project can read. It now says the same thing in its own words and names the
+  setting that runs without pinning.
+
+### Added
+
+- **The server detects a BIOS iGPU memory carve-out and says so.** A fixed
+  block of RAM assigned to graphics in firmware is taken before the kernel
+  boots, so it appears nowhere on the host: the machine simply reports itself
+  smaller. This model reads a 47.7 GiB lookup table through the host file cache
+  on every request, so that RAM is taken directly out of what the table needs.
+  The startup memory ledger now reports the carve-out, and warns when it is
+  large enough to matter, naming the BIOS setting.
+
+  It costs you something even when nothing has visibly thrashed: the KV pool
+  sizes itself from the memory total the OS reports, so a carve-out quietly
+  buys fewer resident conversations instead.
+
+### Documentation
+
+- **The conditions the published numbers were measured under are now stated in
+  full**, after #16 measured our decode 11 to 12 percent low on both rows on a
+  70 W handheld and we had never published a power envelope. The Measured
+  section now names the sustained package power and the clock, and it names the
+  IOMMU, which is worth 13 to 16 percent of prefill on this hardware and which
+  no artifact had ever mentioned.
+- **The kernel command line the reference machine boots with is published**, in
+  a new section under Troubleshooting. Numbers nobody can reproduce are not
+  much use. It is labelled as our configuration rather than a tuning guide, and
+  the two settings that are sizes rather than constants are given as a table
+  per machine size instead of as values to paste.
+- **A startup line in the README had been quoting output the server stopped
+  printing three releases ago**, on the one line that tells you how much memory
+  is left. It now shows what the server actually prints, including the second
+  line explaining why `free` and `MemAvailable` disagree with it by the size of
+  the model.
+- **`docs/QUANT.md` is linked from the README.** It has shipped in this
+  repository since 0.1 and nothing pointed at it, so a reader asking how the
+  bits-per-weight figure is derived had no way to find the answer already here.
+- The README has a table of contents, and the two troubleshooting sections have
+  a heading to live under. The explanation of token budgets covering thinking
+  as well as the answer, which is the difference between a short reply and an
+  empty one, was filed under the Codex section; it applies to every client and
+  now has its own section.
+
+## 0.5.5
+
+### Fixed
+
+- **The server could exit in the middle of serving, taking every request in
+  flight with it.** Reported by [@nr23730](https://github.com/nr23730) (#15),
+  who crashed it twice in a few minutes and posted the log that identified it.
+
+  Any request that used a temperature above 0 together with the speculative
+  drafter (both defaults for most clients) was decoded using a block of memory
+  that had already been released. The sampling settings for the request -
+  temperature, seed, and the repetition penalties - lived in that block, and
+  they were read again on every step of the answer.
+
+  Usually the memory still happened to hold the right values, which is why this
+  went unnoticed for nine releases. When it did not, one of two things
+  happened. If the leftover data looked like a plausible temperature, the reply
+  came back normally but was generated with settings that were not the ones
+  asked for. If it happened to be exactly zero, the server treated it as an
+  internal contradiction and shut itself down, and every other request being
+  served at that moment failed with a 502.
+
+  **If you use temperature above 0, we would treat any sampled output from
+  0.4.x or 0.5.0 through 0.5.4 as unreliable, not merely as occasionally
+  crashy.** Greedy decoding (temperature 0, the default when the field is
+  omitted) was never affected: it does not use that path at all, and a
+  48-request control run confirms it.
+
+  Reproduced on the published 0.5.4 image before the fix was written: four
+  concurrent requests at temperature 0.7 took the container down on the first
+  round. The same test against 0.5.5 completes 48 of 48 with the server up.
+
+### Known
+
+- Some internal consistency checks still stop the whole server rather than
+  failing the one request responsible. Nothing is known to reach them, and the
+  path that did reach one is fixed above, but it is the wrong behaviour for a
+  server handling several conversations and we are changing it.
+
+
+## 0.5.4
+
+### Fixed
+
+- **Long replies no longer slow down as they get longer.** The streaming
+  front-end re-decoded the entire answer on every single token and diffed it
+  against what it had already sent, which costs time proportional to the length
+  squared. A reply of a few thousand tokens spent hundreds of microseconds per
+  token on that alone, and a reply running to the cap would have spent about
+  half a minute of pure bookkeeping.
+
+  It now decodes only the last token or two, which is all that can still
+  change. Detokenization cost is flat at 9 to 19 microseconds per token
+  regardless of output length, where before it climbed from 42 to 726. Long
+  answers no longer pay more per token than short ones. The reporter measured
+  the end-to-end effect on their own host at 34-35 rising to 36-37.6 tok/s on
+  replies of several thousand tokens; our own runs vary by about 7% with
+  machine state, so we quote the detokenization cost, which is the part that
+  is controlled.
+
+  **Reported and diagnosed by [@rosstang](https://github.com/rosstang), with
+  measurements and a differential harness, and independently confirmed by
+  [@hvico](https://github.com/hvico).** The problem, the measurements and the
+  analysis that made the fix possible are theirs; the implementation here is
+  our own, written from the description rather than from their patch, and we
+  verified the tokenizer property ourselves before relying on it. Thank you
+  both. (#13)
+
+- **`response_format` is no longer accepted and silently ignored.** A request
+  asking for JSON or a schema returned 200 and prose, so a client had no way to
+  tell that nothing had enforced it. This server has no constrained decoding,
+  so it cannot honour the field. It now refuses with a 400 that says so, on
+  both `/v1/chat/completions` and `/v1/responses` (where the field is spelled
+  `text.format`), matching what the server already does for any other option it
+  cannot honour. `/health` gained a `not_implemented` list so a client can ask
+  before sending. `{"type": "text"}`, the default, is unaffected.
+
+  **Reported by [@hvico](https://github.com/hvico)**, who also laid out what
+  real support would take. Structured output is not implemented and this
+  release does not add it: it makes the gap visible instead. (#14)
+
+
+## 0.5.3
+
+### Faster
+
+- **Long prompts are read 5 to 8 percent faster, and the answers are
+  byte-for-byte the ones 0.5.2 gave.** Nothing about the model or the
+  arithmetic changed. Every layer has to work out which expert handles which
+  token, and that ordering was being produced by a general-purpose sort running
+  on the CPU while the GPU sat idle waiting for it. There are only 512 experts,
+  so the ordering can be counted out directly instead of compared into place.
+  A stable count on the same key produces the identical ordering by definition,
+  which is why the output is unchanged rather than merely close.
+
+  Measured on this machine against 0.5.2 in the same session, on the tuned plan
+  this image ships:
+
+  | prompt | 0.5.2 | 0.5.3 | |
+  |---|---|---|---|
+  | 8,192 tokens | 1,191 tok/s | **1,246 tok/s** | +4.6% |
+  | 32,768 tokens | 1,317 tok/s | **1,424 tok/s** | +8.1% |
+  | 131,072 tokens | 1,259 tok/s (104.1 s) | **1,358 tok/s (96.5 s)** | +7.9% |
+
+  Decode speed is unchanged, and unchanged by construction: generating a token
+  never takes the path this touches.
+
+  The saving is a fixed amount of time per layer, so it is worth more on a long
+  prompt than a short one, and worth more on a fast machine than a slow one.
+
+### Changed
+
+- **The server now reports the memory it actually holds.** The pre-flight
+  estimate printed at startup says plainly that it is an estimate, and the
+  engine prints measured figures once the model is loaded, including the large
+  lookup table it reads from disk and never keeps in memory.
+
+  This matters for anyone sizing a machine, because the usual tools understate
+  it: the weights are locked in place in a way that `MemAvailable` and `free`
+  do not count, so a loaded server looks like it has roughly 68 GB more room
+  than it has. Nothing but the server itself can correct that figure, so it
+  does.
+
+- **`/health` now names `/cache`**, which carries the live prompt-cache
+  counters. It was reachable before but undiscoverable, since it does not sit
+  under `/v1/`. The counters now include how many times a cache hit had to copy
+  its rows and how long that took: if those climb while the hit rate looks
+  healthy, the host is under memory pressure rather than the cache missing.
+
+
 ## 0.5.2
 
 ### Fixed

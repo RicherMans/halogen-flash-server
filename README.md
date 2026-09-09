@@ -17,20 +17,29 @@ else has published for this model on this hardware:
 
 | | precision | prefill | decode | **total** |
 |---|---|---|---|---|
-| **halogen-flash 0.3.0** | **5.53 bpw** | **25.0 s** | **6.1 s** | **31.1 s** |
+| **halogen-flash 0.5.3** | **5.53 bpw** | **23.0 s** | **6.1 s** | **29.1 s** |
 | [EngramHalo.cpp](https://github.com/Aristo94/EngramHalo.cpp) | 3.71 bpw | 103.7 s | 14.3 s | 118.0 s |
 | [ROCmFP4](https://huggingface.co/kingjones777/Qwen3.8-Flash-Next-ROCmFP4-STRIX-GGUF) | 5.51 bpw | 104.7 s | 13.2 s | 117.9 s |
 | [CIRU-IU4](https://huggingface.co/jcbtc/Qwen3.8-Flash-CIRU-STRIX-IU4) | 5.96 bpw | 143.7 s | 11.0 s | 154.7 s |
 
-**Roughly 3.8x faster end to end than the best of them.** Prefill is where that
+**Roughly 4x faster end to end than the best of them.** Prefill is where that
 is won, and on any prompt with real context prefill is most of the wall clock.
 The one runtime carrying more bits than we do is the slowest of the three, and
 the fastest of them runs at 3.71 bpw, two thirds of our precision.
 
+Our two cells are the rows published under [Measured](#measured), which is also
+where the conditions are: 32,768 tokens at 1,424 tok/s, then 256 tokens at the
+served speculative rate of 41.7 tok/s. Read those conditions before comparing,
+particularly the power envelope. The competitor rows are their own published
+figures on their own machines, and [Against the
+alternatives](#against-the-alternatives) says what differs.
+
 Bits per weight is measured from the checkpoint's own tensor table rather than
 quoted from a format name. It is 5.53 bpw across all 179.55B parameters, or
 4.55 bpw across the trunk and experts with the FP8 n-gram lookup table set
-aside.
+aside. [`docs/QUANT.md`](docs/QUANT.md) gives the breakdown by tensor family
+and says how the figure is derived, so it can be checked with arithmetic rather
+than taken on trust.
 
 **On the decode column, which is the soft one.** Those are the published
 figures at this depth, and for two of the three we cannot tell whether
@@ -45,13 +54,46 @@ At temperature 0, output is byte-identical to serial greedy decode.
 Speculation here is a pure speed optimization, verified on every release, not
 a quality trade.
 
+---
+
+## Contents
+
+- **[Quickstart](#quickstart)**, then **[Using it](#using-it)**:
+  [sampling](#sampling), [images](#images),
+  [token budgets](#token-budgets-and-why-an-empty-answer-means-you-ran-out),
+  [Codex and the Responses API](#codex-and-the-responses-api)
+- **[Give it a machine of its own](#give-it-a-machine-of-its-own)**: what this
+  server holds, and what that leaves for anything else
+- **[Measured](#measured)**: prefill and decode,
+  [against the alternatives](#against-the-alternatives), and
+  [end to end over HTTP](#served-throughput-end-to-end-over-http)
+- **[Quality](#quality-what-is-measured-and-what-is-not)**: what is measured,
+  and what is not
+- **[Precision](#precision-what-you-get-and-how-to-trade-it)**: what you get,
+  and how to trade it
+- **[Configuration](#configuration)**: every setting worth knowing, plus
+  [cache modes](#choosing-a-cache-mode),
+  [context and memory](#context-and-memory-one-kv-pool-several-conversations)
+  and [1M context](#1m-context-opt-in-and-a-different-configuration)
+- **[Troubleshooting](#troubleshooting)**:
+  [will not start](#if-the-server-will-not-start-out-of-memory),
+  [starts but crawls](#if-the-server-starts-but-crawls-on-long-prompts),
+  [the host settings we measured
+  on](#the-host-settings-these-numbers-were-measured-on)
+- **[What this release is not](#what-this-release-is-not)**, and the
+  [license](#license)
+
+---
+
+## Quickstart
+
 ```bash
 podman run --rm -p 8731:8731 \
   --device /dev/kfd --device /dev/dri --group-add keep-groups \
   --security-opt seccomp=unconfined --ipc=host --ulimit memlock=-1:-1 \
   -e HALOGEN_DOWNLOAD=peonist-ai/halogen-qwen3.8-flash-next \
   -v ~/halogen-models:/models \
-  ghcr.io/peonist-ai/halogen-flash-server:0.5.2
+  ghcr.io/peonist-ai/halogen-flash-server:0.5.6
 ```
 
 That is the whole thing. It fetches the weights on first start (118 GiB, so
@@ -71,14 +113,25 @@ podman run --rm -p 8731:8731 \
   --device /dev/kfd --device /dev/dri --group-add keep-groups \
   --security-opt seccomp=unconfined --ipc=host --ulimit memlock=-1:-1 \
   -v ~/halogen-models:/models:ro \
-  ghcr.io/peonist-ai/halogen-flash-server:0.5.2
+  ghcr.io/peonist-ai/halogen-flash-server:0.5.6
 ```
 
 The weights repo carries the tokenizer, so one `-v` is all either form needs.
 On Docker rather than Podman, replace `--group-add keep-groups` with
 `--group-add video --group-add render`: `keep-groups` is a Podman extension.
 
-**Sampling.** `temperature`, `top_p`, `top_k`, `min_p`, `seed`,
+---
+
+## Using it
+
+The server speaks the OpenAI API at `/v1`, and `/health` is the authoritative
+account of what the build you are running supports: the sampling fields,
+whether images are accepted, the token budget aliases and the current default,
+and the tool-call wire format. What follows is the part worth reading first.
+
+### Sampling
+
+`temperature`, `top_p`, `top_k`, `min_p`, `seed`,
 `presence_penalty`, `frequency_penalty`, `logit_bias` and `logprobs` are
 supported. `temperature` absent or 0 is greedy decode. Above 0, the request
 samples from the filtered distribution on the same drafter it would otherwise
@@ -137,6 +190,42 @@ ratio anywhere in the path: tall, wide and square crops all work, and a crop
 under 256x256 is scaled up, which helps small text rather than hurting it. A
 1920x1080 frame occupies about 2,040 tokens of the context.
 
+### Token budgets, and why an empty answer means you ran out
+
+**The token budget covers thinking, not just the answer.** This model reasons
+before it replies and those tokens count against the budget, so a budget that
+runs out mid-thought does not shorten the answer, it removes it: the reply comes
+back with `finish_reason: "length"`, an empty `content`, and the partial
+reasoning in `reasoning_content`, which most OpenAI clients do not display.
+
+The default is **8192**, which finished every ordinary prompt we measured with
+room to spare. Send more when you want more, up to `HALOGEN_MAX_TOKENS_CAP`
+(**65536** by default); above the cap you get a 400 rather than a silent
+truncation, so ask for what you need and the server will tell you if it is too
+much. Hard reasoning problems can genuinely exceed 8192: pass a larger budget,
+or `"reasoning_effort": "low"` to make the model think less. Accepted efforts
+are `minimal`, `low`, `medium`, `high` and `xhigh`; the model's own default is
+`xhigh`.
+
+**Any of three field names works**, and they mean the same thing here:
+`max_completion_tokens` (current OpenAI Chat Completions), `max_output_tokens`
+(OpenAI Responses), or `max_tokens` (deprecated upstream, still widely sent).
+Send one, or send several as long as they agree; two different values is a 400
+rather than a guess about which you meant. `/health` lists all three under
+`token_budget_aliases` and reports the current default as `max_tokens_default`.
+
+```json
+{
+  "model": "halogen-qwen3.8-flash-next",
+  "messages": [{"role": "user", "content": "..."}],
+  "max_completion_tokens": 16384,
+  "reasoning_effort": "low"
+}
+```
+
+If a reply looks empty or cut off, read `finish_reason` first: `"stop"` means
+you have the whole answer, `"length"` means you ran out of budget.
+
 ### Codex and the Responses API
 
 The server also speaks the **OpenAI Responses API** at `POST /v1/responses`, so
@@ -174,47 +263,13 @@ Verified against the Codex CLI driving real tasks end to end, and separately
 against the official `openai` Python SDK, which parses every event into its own
 typed models.
 
-**The token budget covers thinking, not just the answer.** This model reasons
-before it replies and those tokens count against the budget, so a budget that
-runs out mid-thought does not shorten the answer, it removes it: the reply comes
-back with `finish_reason: "length"`, an empty `content`, and the partial
-reasoning in `reasoning_content`, which most OpenAI clients do not display.
-
-The default is **8192**, which finished every ordinary prompt we measured with
-room to spare. Send more when you want more, up to `HALOGEN_MAX_TOKENS_CAP`
-(**65536** by default); above the cap you get a 400 rather than a silent
-truncation, so ask for what you need and the server will tell you if it is too
-much. Hard reasoning problems can genuinely exceed 8192: pass a larger budget,
-or `"reasoning_effort": "low"` to make the model think less. Accepted efforts
-are `minimal`, `low`, `medium`, `high` and `xhigh`; the model's own default is
-`xhigh`.
-
-**Any of three field names works**, and they mean the same thing here:
-`max_completion_tokens` (current OpenAI Chat Completions), `max_output_tokens`
-(OpenAI Responses), or `max_tokens` (deprecated upstream, still widely sent).
-Send one, or send several as long as they agree; two different values is a 400
-rather than a guess about which you meant. `/health` lists all three under
-`token_budget_aliases` and reports the current default as `max_tokens_default`.
-
-```json
-{
-  "model": "halogen-qwen3.8-flash-next",
-  "messages": [{"role": "user", "content": "..."}],
-  "max_completion_tokens": 16384,
-  "reasoning_effort": "low"
-}
-```
-
-If a reply looks empty or cut off, read `finish_reason` first: `"stop"` means
-you have the whole answer, `"length"` means you ran out of budget.
-
 ---
 
 ## Give it a machine of its own
 
 This server holds most of the host once it is loaded: the weights stay resident
-and the KV pool is reserved up front. On a 128 GB machine that leaves a fair
-number of gigabytes free, but very little of it in the large contiguous pieces
+and the KV pool is reserved up front. On a 128 GB machine that leaves roughly
+twelve gigabytes free, and very little of it in the large contiguous pieces
 that another big process needs in order to start or to grow.
 
 If you run application containers, a database, or another model on the same
@@ -224,12 +279,23 @@ whatever asked for it, including this server, can stop for minutes at a time at
 100% of one core with no disk activity and no output. It is not a crash, it
 needs no restart, and it looks exactly like a hang.
 
-The startup line says how much room is left:
+The startup line says how much room is left, and a second line says why your
+own tools will disagree:
 
 ```
-startup [   4.9 s] host memory left for everything else: 620 contiguous 2 MiB
-                   blocks (80.4 GiB total, most of it not contiguous)
+startup [   4.9 s] host memory left for everything else: 465 contiguous 2 MiB
+                   blocks (12.4 GiB total, most of it not contiguous)
+startup [   4.9 s] free(1) and MemAvailable will report about 80.4 GiB
+                   instead: the kernel counts this server's locked weights as
+                   reclaimable file cache, and they cannot be reclaimed
 ```
+
+**Believe the first line.** `free`, `MemAvailable`, and every monitoring tool
+that reads them, count this server's locked weights as reclaimable page cache,
+so they overstate the memory available on this host by the size of the model,
+about 68 GiB. No kernel field reports the difference (`Mlocked` and
+`Unevictable` both stay at zero across the load), which is why the server has
+to print the correction itself.
 
 A few hundred blocks is normal for this server and is fine on a host of its
 own. If that number is small and you have other work on the machine, expect the
@@ -250,21 +316,50 @@ holds cannot be moved. If you need to reclaim it, stop the server.
 ## Measured
 
 **Conditions, because they change the numbers:** AMD Ryzen AI Max+ 395
-(Radeon 8060S, gfx1151), 128 GB unified memory, ROCm 7.14.0. The shipped
-checkpoint and its quality sidecar, in the image's default configuration:
-full 262,144 context, prompt cache on, tuned GEMM plan loaded. Prefill is a cold single-call prefill of real text;
-decode is greedy at temperature 0. Prefill is measured by the engine's own
+(Radeon 8060S, gfx1151), 128 GB unified memory, ROCm 7.14.0, and **about 85 W
+of sustained package power**, sampled from sysfs during a 32,768-token prefill
+alongside a 2,229 MHz median clock against the part's 2,900 MHz top state.
+
+**The IOMMU is off on the reference machine, and it is worth 13 to 16 percent
+of prefill.** Prefill is compute-bound, and on this hardware an enabled IOMMU
+is a power-budget tax rather than a memory-path one: with `iommu=pt` we
+measured the SoC drawing more power (122 to 127 W against 108 to 118) for lower
+shader clocks (2,357 to 2,409 MHz against 2,549 to 2,713) at the same
+temperature, and prefill fell from 460 to 385 tok/s at 2,048 tokens while every
+bandwidth-bound number held exactly. Bisected on one kernel, so it is the IOMMU
+and not the kernel version. We have not measured the IOMMU in translated mode, only off against
+passthrough, and this is one machine.
+
+The full kernel command line this was measured on is published under
+[The host settings these numbers were measured
+on](#the-host-settings-these-numbers-were-measured-on), because numbers you
+cannot reproduce are not much use.
+
+**Match the power envelope before comparing decode numbers.** It is the
+condition most easily left out and it moves these rows: an independent tester
+running a 70 W-limited handheld measured 11 to 12 percent under both the serial
+and the drafted figure below, consistently on both, which is the signature of a
+lower envelope rather than a disagreement about the engine. Prefill reproduced
+on that same machine.
+
+The shipped checkpoint and its quality sidecar, in the image's default
+configuration: full 262,144 context, prompt cache on, tuned GEMM plan loaded.
+Prefill is a cold single-call prefill of real text; decode is greedy at
+temperature 0. Prefill is measured by the engine's own
 prefill bench; a served request with the default speculative drafter pays about
 2-3% more time-to-first-token, because the draft head prefills too. The prefill
-and decode rows are 0.2.0's measurements: 0.3.0 changed the scheduler and the
-memory layout, not the kernels, and a same-session check of the two images at
-the engine's protocol read the same decode rates within 1 tok/s.
+rows are 0.5.3's measurements. The control was this same binary with the
+previous release's ordering step selected, so the two arms differ in one thing
+and nothing else; it ran in the same session, on the plan this image bakes, and
+it reproduced the rows it replaces to within 1.4%. The decode rows are 0.2.0's and have not moved since:
+the releases between them changed the scheduler, the memory layout and one
+host-side sort, not the decode kernels.
 
-| | halogen-flash 0.3.0 |
+| | halogen-flash 0.5.3 |
 |---|---|
-| prefill @ 8,192 | **~1,175 tok/s** (TTFT 7.0 s) |
-| prefill @ 32,768 | **~1,309 tok/s** (TTFT 25.0 s) |
-| prefill @ 131,072 | **1,256 tok/s** (104.4 s) |
+| prefill @ 8,192 | **~1,246 tok/s** (TTFT 6.6 s) |
+| prefill @ 32,768 | **~1,424 tok/s** (TTFT 23.0 s) |
+| prefill @ 131,072 | **1,358 tok/s** (96.5 s) |
 | follow-up turn at 100,000 tokens of context | **~2 s** (prompt cache on, the default) |
 | decode, serial greedy @ ctx 1,500 | **37.6 tok/s** |
 | decode, serial greedy @ ctx 8,000 | **36.1 tok/s** |
@@ -310,13 +405,13 @@ llama.cpp derivatives or forks of one.
 
 | prefill, tok/s | CIRU-IU4 | ROCmFP4 | EngramHalo | **halogen-flash** | vs best |
 |---|---|---|---|---|---|
-| @ 8,192 | 373 | 385 | 436 | **1,175** | **2.7x** |
-| @ 32,768 | 228 | 313 | 316 | **1,309** | **4.1x** |
-| @ 131,072 | 121 | 196 | 174 | **1,256** | **6.4x** |
+| @ 8,192 | 373 | 385 | 436 | **1,246** | **2.9x** |
+| @ 32,768 | 228 | 313 | 316 | **1,424** | **4.5x** |
+| @ 131,072 | 121 | 196 | 174 | **1,358** | **6.9x** |
 
 **The shape matters more than the ratio.** Every one of them decays hard with
-depth. Ours does not: 1,175 at 8K, 1,309 at 32K, 1,256 at 131K. Their own documentation puts it plainly enough. A 156K
-prompt takes EngramHalo about twelve minutes. We prefill 131K in 104 seconds.
+depth. Ours does not: 1,246 at 8K, 1,424 at 32K, 1,358 at 131K. Their own documentation puts it plainly enough. A 156K
+prompt takes EngramHalo about twelve minutes. We prefill 131K in 96 seconds.
 
 Decode is the closer row. Against the fastest of them we are roughly 1.2x on
 code and 1.7x on prose at short context, and the comparison at depth is muddied
@@ -327,8 +422,33 @@ the competitor columns is from their own model card or repository, on their
 machine, at their quantization and their settings. We have not run their
 builds. Their conditions differ from ours in ways that matter: EngramHalo
 measures on a 96 GB machine rather than 128 GB, runs a q8_0 KV cache, and
-keeps the model's 26.8 GiB n-gram table on SSD. Treat the prefill gap as real
+quantizes the n-gram lookup table harder than we do, to 26.8 GiB against our
+47.7 GiB. Keeping that table on disk is not one of the differences: we do the
+same, by default and with no way to turn it off. Treat the prefill gap as real
 and the decode rows as indicative.
+
+### Served throughput, end to end over HTTP
+
+The prefill numbers above are the engine's own prefill bench. Through the full
+stack of chat template, tokenizer, HTTP and SSE, the image's own `sweep` mode
+measures **812 tok/s at pp2048 and 1,041 at pp8192**, and `bench` over ten real prompt
+shapes measures **43.6 tok/s mean with speculation** on the 0.3.0 image (min
+38.5 on chat, max 48.1 on procedural text; 1.63 tokens committed per round;
+the 0.2.0 image read 44.4 in the same session, inside the run-to-run spread).
+Acceptance depends on how predictable the text is, so quote the mean with the
+prompt set named, never a single shape.
+
+That run also re-checks the identity property on live traffic: **every drafter
+produced byte-identical output on every case.**
+
+Reproduce the numbers with the benchmarks baked into the image:
+
+```bash
+podman run ... ghcr.io/peonist-ai/halogen-flash-server:0.5.6 bench serial,mtp 256 low 3
+podman run ... ghcr.io/peonist-ai/halogen-flash-server:0.5.6 sweep -p 8192,32768 -n 128
+```
+
+---
 
 ## Quality: what is measured, and what is not
 
@@ -423,6 +543,12 @@ adding weight, it is spending the same bits better. Measuring each tensor
 family against its own BF16 ceiling put nearly all of the non-expert
 quantization cost in those twelve tensors, 106 MB of a 115 GiB file. At 8 bits
 they measure as a statistical tie with that ceiling.
+
+**Which tensor families are stored at which precision is written out in
+[`docs/QUANT.md`](docs/QUANT.md)**, along with what the sidecar changes and
+what has not been measured. Bits per weight there is computed from the tensor
+shapes in the checkpoint rather than quoted from a format name, so a format
+whose real cost differs from its nominal one shows the difference.
 
 **To trade quality for speed**, point `HALOGEN_CK_OVERLAY` at the speed arm:
 
@@ -629,28 +755,9 @@ on the same machine as the table above:
   must leave room for the generation: a prompt at exactly the context is
   refused.
 
-### Served throughput, end to end over HTTP
-
-The numbers above are the engine's own prefill bench. Through the full stack of
-chat template, tokenizer, HTTP and SSE, the image's own `sweep` mode measures
-**812 tok/s at pp2048 and 1,041 at pp8192**, and `bench` over ten real prompt
-shapes measures **43.6 tok/s mean with speculation** on the 0.3.0 image (min
-38.5 on chat, max 48.1 on procedural text; 1.63 tokens committed per round;
-the 0.2.0 image read 44.4 in the same session, inside the run-to-run spread).
-Acceptance depends on how predictable the text is, so quote the mean with the
-prompt set named, never a single shape.
-
-That run also re-checks the identity property on live traffic: **every drafter
-produced byte-identical output on every case.**
-
-Reproduce the numbers with the benchmarks baked into the image:
-
-```bash
-podman run ... ghcr.io/peonist-ai/halogen-flash-server:0.5.2 bench serial,mtp 256 low 3
-podman run ... ghcr.io/peonist-ai/halogen-flash-server:0.5.2 sweep -p 8192,32768 -n 128
-```
-
 ---
+
+## Troubleshooting
 
 ### If the server will not start: "out of memory"
 
@@ -693,6 +800,30 @@ it:
 free for that cache when it sizes the pool at startup; raising it makes the
 server choose a smaller pool on its own.
 
+**Check the BIOS before you tune anything, if this machine carves memory out
+for the iGPU.** A fixed block assigned to graphics in firmware is taken before
+the kernel boots, so it never shows up as missing anywhere on the host: the
+machine just reports itself smaller, and that RAM is gone from the file cache
+the lookup table depends on. **This server does not need it.** It drives the
+GPU through GTT and allocates from the same unified memory whichever way the
+setting is left, so a large carve-out buys nothing here and costs cache. Set
+the UMA frame buffer or dedicated graphics memory option back to Auto or its
+minimum, which reports about 512 MiB on this hardware.
+
+You are paying for a carve-out even when nothing has thrashed yet. The pool
+sizes itself from the memory total the OS reports, which the carve-out has
+already made smaller, so the server quietly chooses a smaller pool and keeps
+fewer conversations resident than [the pool table](#context-and-memory-one-kv-pool-several-conversations) says. Pin the pool yourself
+and the file cache takes the whole loss instead. Either way the server prints
+what it found at startup, and warns when it is large:
+
+```
+memory: 16.0 GiB of this machine's RAM is carved out for the iGPU in firmware.
+        That is not free memory the OS can lend to the file cache above, and
+        it does not appear anywhere in /proc/meminfo: the machine simply
+        reports itself smaller
+```
+
 Device memory here is system memory, and the ceiling is set by the kernel's
 resident-memory limit rather than by anything a driver reports: measured at
 about 47 GB on a 128 GB machine, and lower on machines carrying more besides
@@ -708,6 +839,55 @@ report. The two lines worth sending on their own are:
 ```
 docker logs <container> 2>&1 | grep -E '^(dmalloc|kv pool):'
 ```
+
+### The host settings these numbers were measured on
+
+Everything in [Measured](#measured) was measured on a machine booted like this,
+and the same command line has been in place unchanged for the whole life of
+this engine. **This is our configuration, not a tuning guide**: of the six
+settings we have A/B'd exactly one, and it is published here so the numbers can
+be reproduced and so a slow machine has somewhere to look.
+
+```
+amdgpu.vm_update_mode=0 amdgpu.noretry=0 amdgpu.gttsize=126976
+ttm.pages_limit=32505856 amdgpu.sg_display=0 amd_iommu=off
+```
+
+**`amd_iommu=off` is the one we have measured, and it is worth 13 to 16 percent
+of prefill.** The numbers and the mechanism are in the conditions paragraph
+above. Two things to weigh before copying it: it turns off DMA translation
+machine-wide, which is a real change in posture on a host that is not dedicated
+to this, and it takes the NPU with it. On a box that exists to serve this model
+it is the right trade and it is the one we made.
+
+**`ttm.pages_limit` and `amdgpu.gttsize` are sizes, not constants. Do not paste
+ours.** GTT is where every allocation this server makes on the GPU actually
+lands, and `ttm.pages_limit` sets that ceiling exactly: 32,505,856 pages times
+4 KiB is 124 GiB, which is 99.3% of this machine's RAM, and it is precisely
+what the driver then reports as its GTT total. Both values say the same thing
+in different units, so set both to about your installed RAM:
+
+| machine | `amdgpu.gttsize` (MiB) | `ttm.pages_limit` (4 KiB pages) |
+|---|---|---|
+| 128 GB | `126976` | `32505856` |
+| 96 GB | `95232` | `24379392` |
+| 64 GB | `63488` | `16252928` |
+
+Pasting the 128 GB row onto a 64 GB machine asks the driver for more GTT than
+the machine has. We have not measured what the kernel's own defaults are here,
+only that ours is what produced these numbers.
+
+The remaining three, `amdgpu.vm_update_mode=0`, `amdgpu.noretry=0` and
+`amdgpu.sg_display=0`, we have never run without. They are listed for
+completeness rather than recommended, and we make no claim about what they buy.
+
+Check what you are on with:
+
+```
+cat /proc/cmdline
+```
+
+---
 
 ## What this release is not
 
@@ -726,6 +906,8 @@ docker logs <container> 2>&1 | grep -E '^(dmalloc|kv pool):'
   or video input.
 - **One GPU, one model family.** gfx1151 only. The build hard-rejects other
   architectures.
+
+---
 
 ## License
 
