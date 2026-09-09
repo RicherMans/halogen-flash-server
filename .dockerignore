@@ -1,0 +1,8 @@
+.git
+docs
+tools
+CHANGELOG.md
+README.md
+LICENSE.md
+THIRD-PARTY-NOTICES.md
+docker-compose.yml
