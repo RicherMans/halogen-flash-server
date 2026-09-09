@@ -36,6 +36,12 @@
 #            `bench` answers "how fast in practice", `sweep` answers "how does
 #            this compare at a fixed size". They are not interchangeable.
 #
+#   llama-swap bridge   (fork): HALOGEN_LLAMA_SWAP=1 listens on
+#            HALOGEN_LLAMA_SWAP_PORT (8732) and proxies to the api, adding the
+#            rate block llama-swap parses so its UI can show tokens/s, plus a
+#            Prometheus /metrics on the same port. Off by default; unset is
+#            byte-identical to upstream.
+#
 # The engine's token protocol has NO AUTH. In `all` it binds loopback INSIDE
 # the container and is unreachable from outside; only the API port is
 # published. If you split the roles you must keep the engine port unpublished
@@ -554,6 +560,21 @@ all)
     --queue-timeout "${HALOGEN_QUEUE_TIMEOUT:-3600}" &
   API_PID=$!
 
+  # THE LLAMA-SWAP BRIDGE IS OFF UNLESS ASKED FOR. It is a fork feature: a
+  # pass-through proxy for the api that adds the rate block llama-swap needs
+  # to show tokens/s, plus a Prometheus /metrics on the same port. Unset is
+  # byte-identical to upstream behaviour. Set HALOGEN_LLAMA_SWAP=1 to listen
+  # on HALOGEN_LLAMA_SWAP_PORT (8732) forwarding to the api on $API_PORT; a
+  # client's -p should then map its port to 8732 (e.g. -p 8732:8732).
+  LLAMA_SWAP_PID=""
+  if [ "${HALOGEN_LLAMA_SWAP:-0}" = "1" ]; then
+    python3 /usr/local/bin/llama-swap-bridge.py \
+      --listen "0.0.0.0:${HALOGEN_LLAMA_SWAP_PORT:-8732}" \
+      --upstream "127.0.0.1:$API_PORT" &
+    LLAMA_SWAP_PID=$!
+    echo "halogen: llama-swap bridge on ${HALOGEN_LLAMA_SWAP_PORT:-8732} (tokens/s for a llama-swap front-end)"
+  fi
+
   # Either process exiting must take the container down. A live API in front
   # of a dead engine answers 200 + zero bytes, which is indistinguishable
   # from a hang on the client side.
@@ -568,9 +589,9 @@ all)
     echo "halogen: engine watchdog OFF (HALOGEN_ENGINE_WATCHDOG_S=0)"
   fi
   # shellcheck disable=SC2086
-  wait -n "$ENGINE_PID" "$API_PID" $WATCHDOG_PID
+  wait -n "$ENGINE_PID" "$API_PID" $WATCHDOG_PID $LLAMA_SWAP_PID
   echo "halogen: a component exited; shutting down" >&2
-  kill -TERM "$ENGINE_PID" "$API_PID" 2>/dev/null || true
+  kill -TERM "$ENGINE_PID" "$API_PID" $LLAMA_SWAP_PID 2>/dev/null || true
   [ -n "$WATCHDOG_PID" ] && kill -9 "$WATCHDOG_PID" 2>/dev/null
   wait || true
   exit 1

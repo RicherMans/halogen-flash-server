@@ -1,0 +1,44 @@
+name: publish
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "Dockerfile"
+      - ".dockerignore"
+      - "deploy/entrypoint.sh"
+      - "deploy/llama-swap-bridge.py"
+      - ".github/workflows/publish.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Self-test the bridge
+        run: python3 deploy/llama-swap-bridge.py --selftest
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build
+        run: docker build -f Dockerfile -t ghcr.io/${{ github.repository }}:0.5.2 .
+
+      - name: Push
+        run: docker push ghcr.io/${{ github.repository }}:0.5.2
