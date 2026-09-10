@@ -353,7 +353,16 @@ class Handler(BaseHTTPRequestHandler):
         end = completion_at or now
         decode = end - first_content_at if first_content_at else (end - time.monotonic())
         decode = max(decode, 0.001)
+        # A real chat.completion.chunk: `choices` is REQUIRED by OpenAI clients
+        # (zod-validated) on every SSE chunk. The empty array is exactly what
+        # llama.cpp/vLLM/OpenAI themselves send on the usage-bearing final chunk;
+        # llama-swap reads only `usage`/`timings` from it.
         payload = {
+            "id": "chatcmpl-halogen",
+            "object": "chat.completion.chunk",
+            "created": int(now),
+            "model": model,
+            "choices": [],
             "usage": {"prompt_tokens": prompt, "completion_tokens": predicted},
             "timings": _timings_block(
                 prompt, predicted,
@@ -471,6 +480,10 @@ def _selftest():
     check("stream timings.predicted_n", chunk is not None and chunk.get("timings", {}).get("predicted_n") == 4)
     check("stream timings.predicted_per_second", chunk is not None and chunk.get("timings", {}).get("predicted_per_second", 0) > 0)
     check("timings come before [DONE]", chunk is not None and raw.find('"timings"') < raw.find("data: [DONE]"))
+    check("injected chunk is a valid chat.completion.chunk",
+          chunk is not None and chunk.get("choices") == []
+          and chunk.get("object") == "chat.completion.chunk"
+          and chunk.get("id") and chunk.get("model"))
 
     r = call("/health")
     check("health passes through", r.status == 200 and r.read() == b"ok")
