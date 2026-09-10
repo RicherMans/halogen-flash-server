@@ -36,11 +36,11 @@
 #            `bench` answers "how fast in practice", `sweep` answers "how does
 #            this compare at a fixed size". They are not interchangeable.
 #
-#   llama-swap bridge   (fork): HALOGEN_LLAMA_SWAP=1 listens on
-#            HALOGEN_LLAMA_SWAP_PORT (8732) and proxies to the api, adding the
-#            rate block llama-swap parses so its UI can show tokens/s, plus a
-#            Prometheus /metrics on the same port. Off by default; unset is
-#            byte-identical to upstream.
+#   llama-swap bridge   (fork): ON by default; the api is proxied on
+#            HALOGEN_LLAMA_SWAP_PORT (8732), adding the rate block llama-swap
+#            parses so its UI can show tokens/s, plus a Prometheus /metrics on
+#            the same port. Set HALOGEN_LLAMA_SWAP=0 for an upstream-identical
+#            container (no bridge; -p maps to the api on $API_PORT).
 #
 # The engine's token protocol has NO AUTH. In `all` it binds loopback INSIDE
 # the container and is unreachable from outside; only the API port is
@@ -715,21 +715,21 @@ all)
     --max-tokens-cap "${HALOGEN_MAX_TOKENS_CAP:-65536}" \
     --queue-timeout "${HALOGEN_QUEUE_TIMEOUT:-3600}" &
   API_PID=$!
-
-  # THE LLAMA-SWAP BRIDGE IS OFF UNLESS ASKED FOR. It is a fork feature: a
-  # pass-through proxy for the api that adds the rate block llama-swap needs
-  # to show tokens/s, plus a Prometheus /metrics on the same port. Unset is
-  # byte-identical to upstream behaviour. Set HALOGEN_LLAMA_SWAP=1 to listen
-  # on HALOGEN_LLAMA_SWAP_PORT (8732) forwarding to the api on $API_PORT; a
-  # client's -p should then map its port to 8732 (e.g. -p 8732:8732).
+  # THE LLAMA-SWAP BRIDGE IS ON BY DEFAULT in this fork. It is a pass-through
+  # proxy for the api that adds the rate block llama-swap needs to show
+  # tokens/s, plus a Prometheus /metrics on the same port. With it on, a
+  # client's -p maps to the BRIDGE on HALOGEN_LLAMA_SWAP_PORT (e.g. -p 8732:8732);
+  # the api stays on $API_PORT inside the container. Set HALOGEN_LLAMA_SWAP=0
+  # for an upstream-identical container, where -p maps to the api directly.
   LLAMA_SWAP_PID=""
-  if [ "${HALOGEN_LLAMA_SWAP:-0}" = "1" ]; then
+  if [ "${HALOGEN_LLAMA_SWAP:-1}" != "0" ]; then
     python3 /usr/local/bin/llama-swap-bridge.py \
       --listen "0.0.0.0:${HALOGEN_LLAMA_SWAP_PORT:-8732}" \
       --upstream "127.0.0.1:$API_PORT" &
     LLAMA_SWAP_PID=$!
     echo "halogen: llama-swap bridge on ${HALOGEN_LLAMA_SWAP_PORT:-8732} (tokens/s for a llama-swap front-end)"
   fi
+
 
   # Either process exiting must take the container down. A live API in front
   # of a dead engine answers 200 + zero bytes, which is indistinguishable
@@ -814,3 +814,4 @@ except Exception: sys.exit(1)" 2>/dev/null && { API_UP=1; break; }
   ;;
 *) echo "usage: entrypoint.sh [all|engine|api|bench|sweep]" >&2; exit 2 ;;
 esac
+

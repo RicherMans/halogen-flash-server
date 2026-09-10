@@ -19,14 +19,14 @@ FILE = "deploy/entrypoint.sh"
 
 MARKER = "HALOGEN_LLAMA_SWAP"
 
-_BLOCK = """  # THE LLAMA-SWAP BRIDGE IS OFF UNLESS ASKED FOR. It is a fork feature: a
-  # pass-through proxy for the api that adds the rate block llama-swap needs
-  # to show tokens/s, plus a Prometheus /metrics on the same port. Unset is
-  # byte-identical to upstream behaviour. Set HALOGEN_LLAMA_SWAP=1 to listen
-  # on HALOGEN_LLAMA_SWAP_PORT (8732) forwarding to the api on $API_PORT; a
-  # client's -p should then map its port to 8732 (e.g. -p 8732:8732).
+_BLOCK = """  # THE LLAMA-SWAP BRIDGE IS ON BY DEFAULT in this fork. It is a pass-through
+  # proxy for the api that adds the rate block llama-swap needs to show
+  # tokens/s, plus a Prometheus /metrics on the same port. With it on, a
+  # client's -p maps to the BRIDGE on HALOGEN_LLAMA_SWAP_PORT (e.g. -p 8732:8732);
+  # the api stays on $API_PORT inside the container. Set HALOGEN_LLAMA_SWAP=0
+  # for an upstream-identical container, where -p maps to the api directly.
   LLAMA_SWAP_PID=""
-  if [ "${HALOGEN_LLAMA_SWAP:-0}" = "1" ]; then
+  if [ "${HALOGEN_LLAMA_SWAP:-1}" != "0" ]; then
     python3 /usr/local/bin/llama-swap-bridge.py \\
       --listen "0.0.0.0:${HALOGEN_LLAMA_SWAP_PORT:-8732}" \\
       --upstream "127.0.0.1:$API_PORT" &
@@ -39,11 +39,11 @@ _ANCHOR = "  API_PID=$!\n"
 _SENTINEL = "Either process exiting must take the container down"
 
 _HEADER_NOTE = (
-    "#   llama-swap bridge   (fork): HALOGEN_LLAMA_SWAP=1 listens on\n"
-    "#            HALOGEN_LLAMA_SWAP_PORT (8732) and proxies to the api, adding the\n"
-    "#            rate block llama-swap parses so its UI can show tokens/s, plus a\n"
-    "#            Prometheus /metrics on the same port. Off by default; unset is\n"
-    "#            byte-identical to upstream.\n"
+    "#   llama-swap bridge   (fork): ON by default; the api is proxied on\n"
+    "#            HALOGEN_LLAMA_SWAP_PORT (8732), adding the rate block llama-swap\n"
+    "#            parses so its UI can show tokens/s, plus a Prometheus /metrics on\n"
+    "#            the same port. Set HALOGEN_LLAMA_SWAP=0 for an upstream-identical\n"
+    "#            container (no bridge; -p maps to the api on $API_PORT).\n"
     "#\n"
 )
 _HEADER_ANCHOR = "# The engine's token protocol has NO AUTH."

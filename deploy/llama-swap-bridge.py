@@ -12,6 +12,8 @@ then emits a ``timings`` block named the way llama-swap parses it. Streaming
 (SSE) responses get one synthetic ``data:`` chunk carrying ``usage`` and
 ``timings`` immediately before ``[DONE]``; non-streaming responses get the
 same block added to their JSON body. Everything else is proxied untouched.
+The container's entrypoint starts it by default in `all` mode
+(HALOGEN_LLAMA_SWAP=0 disables it, for an upstream-identical container).
 
 It also serves Prometheus ``/metrics`` on the same port, with the canonical
 llama.cpp metric names, so the numbers are scrapeable whether or not
