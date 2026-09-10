@@ -4,16 +4,15 @@
 # and ship in the public release image, so this is a THIN derivative: it bases
 # on that image and layers only this fork's additions on top.
 #
-# The only behavioural addition is the llama-swap bridge, OFF unless
-# HALOGEN_LLAMA_SWAP=1. Unset (the shipped state), behaviour is byte-identical
-# to the upstream image.
+# The only behavioural addition is the llama-swap bridge, ON by default.
+# Set HALOGEN_LLAMA_SWAP=0 for a container identical to the upstream image.
 #
 #   docker build -t ghcr.io/<you>/halogen-flash-server:0.5.6 -f Dockerfile .
 #
 # Usage (llama-swap front-end, bridge exposed):
 #   docker run --rm --device /dev/kfd --device /dev/dri --group-add keep-groups \
 #     --security-opt seccomp=unconfined --ipc=host --ulimit memlock=-1:-1 \
-#     -e HALOGEN_LLAMA_SWAP=1 -p 8732:8732 \
+#     -p 8732:8732 \
 #     -v ~/halogen-models:/models:ro \
 #     ghcr.io/<you>/halogen-flash-server:0.5.6
 #
