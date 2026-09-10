@@ -36,6 +36,10 @@ from urllib.parse import urlparse
 
 DEFAULT_MODEL = "halogen-qwen3.8-flash-next"
 WINDOW_S = 60.0
+# A decode rate above this cannot be real on this hardware (measured ~40 tok/s
+# decode, ~1.4k tok/s prefill). A rate that exceeds it means the timing window
+# collapsed, not that the model is fast, so it is reported as 0 instead.
+MAX_PLAUSIBLE_TPS = 10000.0
 
 _HOP = frozenset({
     "connection", "keep-alive", "proxy-connection", "transfer-encoding",
@@ -138,13 +142,28 @@ def _usage_counts(obj):
     return 0, 0
 
 
-def _has_content_choice(obj):
+def _has_generated_delta(obj):
+    """True when an SSE event carries at least one generated token.
+
+    Covers answer content, thinking (Qwen-style ``reasoning_content`` /
+    ``reasoning``) and tool calls, so the decode window starts at the first
+    token the model emits rather than the first token that happens to be
+    answer text. A reasoning-heavy turn that opens with a long think and a
+    one-token answer otherwise looked like it decoded at millions of tok/s.
+    """
     try:
         for c in obj.get("choices") or []:
             d = c.get("delta") or {}
-            if d.get("content"):
+            if (d.get("content") or d.get("reasoning_content")
+                    or d.get("reasoning") or d.get("tool_calls")):
+                return True
+            m = c.get("message") or {}
+            if (m.get("content") or m.get("reasoning_content")
+                    or m.get("reasoning") or m.get("tool_calls")):
                 return True
         for item in obj.get("output") or []:
+            if item.get("type") in ("reasoning", "function_call"):
+                return True
             for part in item.get("content") or []:
                 if part.get("type") == "output_text" and part.get("text"):
                     return True
@@ -160,6 +179,27 @@ def _timings_block(prompt, predicted, prompt_ps, predicted_ps):
         "prompt_per_second": float(f"{prompt_ps:.3f}"),
         "predicted_per_second": float(f"{predicted_ps:.3f}"),
     }
+
+
+def _window(start, end):
+    """A measured window, floored at 1ms so a fast local call cannot divide by
+    (near) zero. This floor is why the plausibility guard below exists."""
+    return max(end - start, 0.001)
+
+
+def _rate(tokens, window):
+    """Tokens/s over a measured window, or 0.0 when it cannot be trusted.
+
+    llama-swap stores and displays the ``predicted_per_second`` it is handed
+    with no sanity check, so an unmeasurable window must report 0 rather than
+    a fabricated number.
+    """
+    if tokens <= 0 or window <= 0:
+        return 0.0
+    rate = tokens / window
+    if not (0.0 < rate < MAX_PLAUSIBLE_TPS):
+        return 0.0
+    return rate
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -209,6 +249,11 @@ class Handler(BaseHTTPRequestHandler):
             if k.lower() not in _HOP:
                 headers[k] = v
         headers.setdefault("Accept-Encoding", "identity")
+        # Timed from before the request is sent. A non-streaming completion
+        # sends its headers only after the whole answer is generated, so
+        # timing from getresponse() measured body transfer and produced
+        # millions of tok/s.
+        started = time.monotonic()
         try:
             conn.request(self.command, self.path, body=body, headers=headers)
             resp = conn.getresponse()
@@ -220,7 +265,6 @@ class Handler(BaseHTTPRequestHandler):
                         if k.lower() not in _HOP and k.lower() != "content-length"]
         ctype = resp.getheader("Content-Type", "")
         path = self.path.split("?")[0]
-        started = time.monotonic()
         is_inference = path in _INFERENCE
 
         if not is_inference or resp.status != 200:
@@ -234,7 +278,7 @@ class Handler(BaseHTTPRequestHandler):
         if "text/event-stream" in ctype:
             self._respond(200, header_pairs, "text/event-stream", None)
             try:
-                self._stream(resp, body)
+                self._stream(resp, body, started)
             except OSError:
                 pass
             finally:
@@ -292,21 +336,24 @@ class Handler(BaseHTTPRequestHandler):
             return data
         model = _request_model(req_body)
         prompt, predicted = _usage_counts(obj)
-        wall = max(time.monotonic() - started, 0.001)
+        # Non-streaming cannot observe a decode window, so both rates use the
+        # whole-request wall as a conservative lower bound. `started` is
+        # before the upstream request was sent, so it includes generation.
+        wall = _window(started, time.monotonic())
         obj.setdefault("timings", {})
         obj["timings"].update(_timings_block(
             prompt, predicted,
-            prompt / wall if prompt else 0.0,
-            predicted / wall if predicted else 0.0,
+            _rate(prompt, wall),
+            _rate(predicted, wall),
         ))
         REGISTRY.record(model, prompt, predicted)
         return json.dumps(obj, ensure_ascii=False).encode()
 
-    def _stream(self, resp, req_body):
+    def _stream(self, resp, req_body, started):
         model = _request_model(req_body)
         prompt = predicted = 0
-        content_events = 0
-        first_content_at = None
+        token_events = 0
+        first_token_at = None
         completion_at = None
         injected = False
         fp = resp.fp
@@ -318,8 +365,8 @@ class Handler(BaseHTTPRequestHandler):
             is_done = line.strip().startswith(b"data: [DONE]")
             if is_done:
                 if not injected:
-                    self._inject(model, prompt, predicted, content_events,
-                                 first_content_at, completion_at)
+                    self._inject(model, prompt, predicted, token_events,
+                                 first_token_at, completion_at, started)
                     injected = True
                 self.wfile.write(line)
                 self.wfile.flush()
@@ -338,21 +385,29 @@ class Handler(BaseHTTPRequestHandler):
                             prompt, predicted = p, pc
                             if completion_at is None:
                                 completion_at = time.monotonic()
-                        elif _has_content_choice(obj):
-                            content_events += 1
-                            if first_content_at is None:
-                                first_content_at = time.monotonic()
+                        elif _has_generated_delta(obj):
+                            token_events += 1
+                            if first_token_at is None:
+                                first_token_at = time.monotonic()
             self.wfile.write(line)
             self.wfile.flush()
 
-    def _inject(self, model, prompt, predicted, content_events,
-                first_content_at, completion_at):
-        if not (prompt or predicted) and content_events:
-            predicted = content_events
+    def _inject(self, model, prompt, predicted, token_events,
+                first_token_at, completion_at, started):
+        if not (prompt or predicted) and token_events:
+            predicted = token_events
         now = time.monotonic()
         end = completion_at or now
-        decode = end - first_content_at if first_content_at else (end - time.monotonic())
-        decode = max(decode, 0.001)
+        # The first generated token is the start of decode; `started` is the
+        # request start, so the run-up to the first token is the prefill
+        # window. If usage arrived before any token (or no token was seen at
+        # all) the decode window is unmeasurable, so fall back to the whole
+        # request rather than dividing by the old ~0.001s artifact.
+        first = first_token_at or started
+        if first > end:
+            first = started
+        prefill = _window(started, first)
+        decode = _window(first, end)
         # A real chat.completion.chunk: `choices` is REQUIRED by OpenAI clients
         # (zod-validated) on every SSE chunk. The empty array is exactly what
         # llama.cpp/vLLM/OpenAI themselves send on the usage-bearing final chunk;
@@ -366,8 +421,8 @@ class Handler(BaseHTTPRequestHandler):
             "usage": {"prompt_tokens": prompt, "completion_tokens": predicted},
             "timings": _timings_block(
                 prompt, predicted,
-                prompt / decode if prompt else 0.0,
-                predicted / decode if predicted else 0.0,
+                _rate(prompt, prefill),
+                _rate(predicted, decode),
             ),
         }
         REGISTRY.record(model, prompt, predicted)
@@ -381,6 +436,39 @@ class BridgeServer(ThreadingHTTPServer):
         super().__init__(addr, handler)
         self.upstream = upstream
         self.upstream_timeout = upstream_timeout
+
+
+def _stub_events(scenario):
+    """Canned SSE events for the bridge self-test.
+
+    `reasoning` models a thinking-only turn that ends on the token budget
+    (`finish_reason: length`, empty content). `reasoning_then_content` models
+    a think followed by a short answer. Both are the shapes that used to make
+    the bridge collapse its decode window and emit millions of tok/s.
+    """
+    if scenario == "reasoning":
+        return [
+            {"choices": [{"delta": {"role": "assistant"}}]},
+            {"choices": [{"delta": {"reasoning_content": "Think. "}}]},
+            {"choices": [{"delta": {"reasoning_content": "Think more."}}]},
+            {"choices": [{"delta": {}, "finish_reason": "length"}],
+             "usage": {"prompt_tokens": 7, "completion_tokens": 4}},
+        ]
+    if scenario == "reasoning_then_content":
+        return [
+            {"choices": [{"delta": {"role": "assistant"}}]},
+            {"choices": [{"delta": {"reasoning_content": "Think."}}]},
+            {"choices": [{"delta": {"content": "Answer."}}]},
+            {"choices": [{"delta": {}}],
+             "usage": {"prompt_tokens": 7, "completion_tokens": 4}},
+        ]
+    return [
+        {"choices": [{"delta": {"role": "assistant"}}]},
+        {"choices": [{"delta": {"content": "Hello from "}}]},
+        {"choices": [{"delta": {"content": "the stub."}}]},
+        {"choices": [{"delta": {}}],
+         "usage": {"prompt_tokens": 7, "completion_tokens": 4}},
+    ]
 
 
 def _selftest():
@@ -418,13 +506,7 @@ def _selftest():
                 self.send_response(200)
                 self.send_header("Content-Type", "text/event-stream")
                 self.end_headers()
-                for ev in [
-                    {"choices": [{"delta": {"role": "assistant"}}]},
-                    {"choices": [{"delta": {"content": "Hello from "}}]},
-                    {"choices": [{"delta": {"content": "the stub."}}]},
-                    {"choices": [{"delta": {}}],
-                     "usage": {"prompt_tokens": 7, "completion_tokens": 4}},
-                ]:
+                for ev in _stub_events(req.get("scenario")):
                     self.wfile.write(f"data: {json.dumps(ev)}\n\n".encode())
                     self.wfile.flush()
                 self.wfile.write(b"data: [DONE]\n\n")
@@ -484,6 +566,25 @@ def _selftest():
           chunk is not None and chunk.get("choices") == []
           and chunk.get("object") == "chat.completion.chunk"
           and chunk.get("id") and chunk.get("model"))
+
+    # Reasoning-heavy turns are the ones that used to report millions of
+    # tok/s: thinking is generated but was not counted, so the decode window
+    # collapsed. The rate must now be positive and physically plausible.
+    def _timings_chunk(raw):
+        found = None
+        for line in raw.splitlines():
+            if line.startswith("data: ") and '"timings"' in line:
+                found = json.loads(line[6:])
+        return found
+
+    for scenario in ("reasoning", "reasoning_then_content"):
+        r = call("/v1/chat/completions",
+                 dict(payload, stream=True, scenario=scenario))
+        tc = _timings_chunk(r.read().decode())
+        check(f"{scenario} stream carries timings", tc is not None)
+        rate = tc.get("timings", {}).get("predicted_per_second", 0) if tc else 0
+        check(f"{scenario} predicted_per_second is sane",
+              0 < rate < MAX_PLAUSIBLE_TPS)
 
     r = call("/health")
     check("health passes through", r.status == 200 and r.read() == b"ok")
