@@ -126,19 +126,37 @@ def _request_model(body):
     return DEFAULT_MODEL
 
 
+def _as_int(value):
+    """Token counts from a response field, or 0 when it is not a number.
+
+    Upstreams occasionally put a string or a nested object where a count is
+    expected; that must not crash the proxy, so anything non-numeric is read
+    as 0 rather than raised.
+    """
+    if isinstance(value, bool) or value is None:
+        return 0
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return 0
+
+
 def _usage_counts(obj):
     prompt = predicted = 0
-    for path in _USAGE_PATHS:
-        u = obj
-        for key in path.split("."):
-            if not isinstance(u, dict) or key not in u:
-                break
-            u = u[key]
-        else:
-            if isinstance(u, dict):
-                prompt = int(u.get("prompt_tokens", u.get("input_tokens", 0)) or 0)
-                predicted = int(u.get("completion_tokens", u.get("output_tokens", 0)) or 0)
-                return prompt, predicted
+    try:
+        for path in _USAGE_PATHS:
+            u = obj
+            for key in path.split("."):
+                if not isinstance(u, dict) or key not in u:
+                    break
+                u = u[key]
+            else:
+                if isinstance(u, dict):
+                    prompt = _as_int(u.get("prompt_tokens", u.get("input_tokens", 0)))
+                    predicted = _as_int(u.get("completion_tokens", u.get("output_tokens", 0)))
+                    return prompt, predicted
+    except (AttributeError, TypeError):
+        return 0, 0
     return 0, 0
 
 
@@ -152,6 +170,12 @@ def _has_generated_delta(obj):
     one-token answer otherwise looked like it decoded at millions of tok/s.
     """
     try:
+        # OpenAI Responses streams typed events (``response.output_text.delta``,
+        # ``response.reasoning_summary_text.delta``, ...) whose payload is a
+        # top-level ``delta`` string, not a choices array.
+        etype = obj.get("type")
+        if isinstance(etype, str) and etype.endswith(".delta") and obj.get("delta"):
+            return True
         for c in obj.get("choices") or []:
             d = c.get("delta") or {}
             if (d.get("content") or d.get("reasoning_content")
@@ -202,6 +226,28 @@ def _rate(tokens, window):
     return rate
 
 
+def _computed_timings(prompt, predicted, first_token_at, completion_at, started):
+    """The bridge's own timings block for one turn.
+
+    The first generated token is the start of decode; `started` is the request
+    start, so the run-up to the first token is the prefill window. If usage
+    arrived before any token (or no token was seen at all) the decode window
+    is unmeasurable, so fall back to the whole request rather than the old
+    ~0.001s artifact.
+    """
+    end = completion_at or time.monotonic()
+    first = first_token_at or started
+    if first > end:
+        first = started
+    prefill = _window(started, first)
+    decode = _window(first, end)
+    return _timings_block(
+        prompt, predicted,
+        _rate(prompt, prefill),
+        _rate(predicted, decode),
+    )
+
+
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     server_version = "llama-swap-bridge"
@@ -232,10 +278,40 @@ class Handler(BaseHTTPRequestHandler):
         self._proxy()
 
     def _read_body(self):
-        length = int(self.headers.get("Content-Length") or 0)
+        encoding = (self.headers.get("Transfer-Encoding") or "").lower()
+        if "chunked" in encoding:
+            return self._read_chunked_body()
+        length = _as_int(self.headers.get("Content-Length"))
         if length <= 0:
             return None
         return self.rfile.read(length)
+
+    def _read_chunked_body(self):
+        """De-chunk a request body.
+
+        Some clients send POST bodies as ``Transfer-Encoding: chunked`` with no
+        ``Content-Length``. That header is hop-by-hop and stripped before the
+        request is forwarded, so the body has to be reassembled here or the
+        upstream would see an empty request.
+        """
+        body = bytearray()
+        while True:
+            size_line = self.rfile.readline(65536)
+            if not size_line:
+                break
+            try:
+                size = int(size_line.split(b";", 1)[0].strip(), 16)
+            except ValueError:
+                break
+            if size == 0:
+                while True:
+                    trailer = self.rfile.readline(65536)
+                    if not trailer or trailer in (b"\r\n", b"\n"):
+                        break
+                break
+            body += self.rfile.read(size)
+            self.rfile.read(2)
+        return bytes(body) if body else None
 
     def _proxy(self, head_only=False):
         if self.path.split("?")[0] == "/metrics" and self.command == "GET":
@@ -278,7 +354,7 @@ class Handler(BaseHTTPRequestHandler):
         if "text/event-stream" in ctype:
             self._respond(200, header_pairs, "text/event-stream", None)
             try:
-                self._stream(resp, body, started)
+                self._stream(resp, body, started, path)
             except OSError:
                 pass
             finally:
@@ -340,74 +416,106 @@ class Handler(BaseHTTPRequestHandler):
         # whole-request wall as a conservative lower bound. `started` is
         # before the upstream request was sent, so it includes generation.
         wall = _window(started, time.monotonic())
-        obj.setdefault("timings", {})
-        obj["timings"].update(_timings_block(
+        computed = _timings_block(
             prompt, predicted,
             _rate(prompt, wall),
             _rate(predicted, wall),
-        ))
+        )
+        # Never overwrite a real timings block an upstream supplied; fill in
+        # only the fields it did not provide.
+        existing = obj.get("timings")
+        if isinstance(existing, dict):
+            for key, value in computed.items():
+                existing.setdefault(key, value)
+        else:
+            obj["timings"] = computed
         REGISTRY.record(model, prompt, predicted)
         return json.dumps(obj, ensure_ascii=False).encode()
 
-    def _stream(self, resp, req_body, started):
+    def _stream(self, resp, req_body, started, path):
         model = _request_model(req_body)
+        is_responses = path == "/v1/responses"
         prompt = predicted = 0
         token_events = 0
         first_token_at = None
         completion_at = None
+        upstream_timings = None
         injected = False
         fp = resp.fp
 
-        while True:
-            line = fp.readline(65536)
-            if not line:
-                break
-            is_done = line.strip().startswith(b"data: [DONE]")
-            if is_done:
-                if not injected:
-                    self._inject(model, prompt, predicted, token_events,
-                                 first_token_at, completion_at, started)
-                    injected = True
+        try:
+            while True:
+                line = fp.readline(65536)
+                if not line:
+                    break
+                is_done = line.strip().startswith(b"data: [DONE]")
+                if is_done:
+                    # Responses clients never see this sentinel; if it shows up
+                    # anyway, do not drop a chat-shaped chunk into their stream.
+                    if not injected and not is_responses:
+                        self._inject(model, prompt, predicted, token_events,
+                                     first_token_at, completion_at, started,
+                                     upstream_timings)
+                        injected = True
+                    self.wfile.write(line)
+                    self.wfile.flush()
+                    continue
+                stripped = line.strip()
+                if stripped.startswith(b"data:"):
+                    data = stripped[5:].strip()
+                    if data:
+                        try:
+                            obj = json.loads(data.decode("utf-8"))
+                        except ValueError:
+                            obj = {}
+                        if isinstance(obj, dict):
+                            t = obj.get("timings")
+                            if isinstance(t, dict):
+                                upstream_timings = t
+                            p, pc = _usage_counts(obj)
+                            if p or pc:
+                                prompt, predicted = p, pc
+                                if completion_at is None:
+                                    completion_at = time.monotonic()
+                            elif _has_generated_delta(obj):
+                                token_events += 1
+                                if first_token_at is None:
+                                    first_token_at = time.monotonic()
+                            # The Responses stream has no [DONE]; attach the
+                            # rate to its own response.completed event so no
+                            # foreign, chat-shaped chunk reaches the client.
+                            if (is_responses and not injected
+                                    and obj.get("type") == "response.completed"):
+                                if not (prompt or predicted):
+                                    prompt, predicted = _usage_counts(obj)
+                                if not (prompt or predicted) and token_events:
+                                    predicted = token_events
+                                obj["timings"] = upstream_timings or _computed_timings(
+                                    prompt, predicted, first_token_at,
+                                    completion_at, started)
+                                line = f"data: {json.dumps(obj)}\n\n".encode()
+                                injected = True
                 self.wfile.write(line)
                 self.wfile.flush()
-                continue
-            stripped = line.strip()
-            if stripped.startswith(b"data:"):
-                data = stripped[5:].strip()
-                if data:
-                    try:
-                        obj = json.loads(data.decode("utf-8"))
-                    except ValueError:
-                        obj = {}
-                    if isinstance(obj, dict):
-                        p, pc = _usage_counts(obj)
-                        if p or pc:
-                            prompt, predicted = p, pc
-                            if completion_at is None:
-                                completion_at = time.monotonic()
-                        elif _has_generated_delta(obj):
-                            token_events += 1
-                            if first_token_at is None:
-                                first_token_at = time.monotonic()
-            self.wfile.write(line)
-            self.wfile.flush()
+        finally:
+            # A client can hang up mid-stream, so inject on EOF/abort too. For
+            # Responses we deliberately inject nothing rather than a chunk its
+            # parser would reject.
+            if not injected and not is_responses:
+                self._inject(model, prompt, predicted, token_events,
+                             first_token_at, completion_at, started,
+                             upstream_timings)
+                injected = True
 
     def _inject(self, model, prompt, predicted, token_events,
-                first_token_at, completion_at, started):
+                first_token_at, completion_at, started, upstream_timings=None):
+        if upstream_timings and not (prompt or predicted):
+            prompt = _as_int(upstream_timings.get("prompt_n"))
+            predicted = _as_int(upstream_timings.get("predicted_n"))
         if not (prompt or predicted) and token_events:
             predicted = token_events
-        now = time.monotonic()
-        end = completion_at or now
-        # The first generated token is the start of decode; `started` is the
-        # request start, so the run-up to the first token is the prefill
-        # window. If usage arrived before any token (or no token was seen at
-        # all) the decode window is unmeasurable, so fall back to the whole
-        # request rather than dividing by the old ~0.001s artifact.
-        first = first_token_at or started
-        if first > end:
-            first = started
-        prefill = _window(started, first)
-        decode = _window(first, end)
+        timings = upstream_timings or _computed_timings(
+            prompt, predicted, first_token_at, completion_at, started)
         # A real chat.completion.chunk: `choices` is REQUIRED by OpenAI clients
         # (zod-validated) on every SSE chunk. The empty array is exactly what
         # llama.cpp/vLLM/OpenAI themselves send on the usage-bearing final chunk;
@@ -415,15 +523,11 @@ class Handler(BaseHTTPRequestHandler):
         payload = {
             "id": "chatcmpl-halogen",
             "object": "chat.completion.chunk",
-            "created": int(now),
+            "created": int(time.time()),
             "model": model,
             "choices": [],
             "usage": {"prompt_tokens": prompt, "completion_tokens": predicted},
-            "timings": _timings_block(
-                prompt, predicted,
-                _rate(prompt, prefill),
-                _rate(predicted, decode),
-            ),
+            "timings": timings,
         }
         REGISTRY.record(model, prompt, predicted)
         self.wfile.write(f"data: {json.dumps(payload)}\n\n".encode())
@@ -461,6 +565,31 @@ def _stub_events(scenario):
             {"choices": [{"delta": {"content": "Answer."}}]},
             {"choices": [{"delta": {}}],
              "usage": {"prompt_tokens": 7, "completion_tokens": 4}},
+        ]
+    if scenario == "responses":
+        # The Responses API streams typed events and ends with
+        # response.completed; there is no [DONE] sentinel.
+        return [
+            {"type": "response.created", "response": {}},
+            {"type": "response.output_text.delta", "delta": "Hello "},
+            {"type": "response.output_text.delta", "delta": "world"},
+            {"type": "response.completed",
+             "response": {"usage": {"input_tokens": 5, "output_tokens": 2}}},
+        ]
+    if scenario == "bogus_usage":
+        return [
+            {"choices": [{"delta": {"content": "Hello."}}]},
+            {"choices": [{"delta": {}}],
+             "usage": {"prompt_tokens": "seven", "completion_tokens": {"n": 4}}},
+        ]
+    if scenario == "upstream_timings":
+        return [
+            {"choices": [{"delta": {"content": "Hello."}}]},
+            {"choices": [{"delta": {}}],
+             "usage": {"prompt_tokens": 7, "completion_tokens": 4},
+             "timings": {"prompt_n": 7, "predicted_n": 4,
+                         "prompt_per_second": 111.0,
+                         "predicted_per_second": 222.0}},
         ]
     return [
         {"choices": [{"delta": {"role": "assistant"}}]},
@@ -501,23 +630,33 @@ def _selftest():
 
         def do_POST(self):
             length = int(self.headers.get("Content-Length") or 0)
-            req = json.loads(self.rfile.read(length) or b"{}")
+            raw = self.rfile.read(length) if length > 0 else b""
+            req = json.loads(raw or b"{}")
+            scenario = req.get("scenario")
             if req.get("stream"):
                 self.send_response(200)
                 self.send_header("Content-Type", "text/event-stream")
                 self.end_headers()
-                for ev in _stub_events(req.get("scenario")):
+                for ev in _stub_events(scenario):
                     self.wfile.write(f"data: {json.dumps(ev)}\n\n".encode())
                     self.wfile.flush()
-                self.wfile.write(b"data: [DONE]\n\n")
-                self.wfile.flush()
+                if scenario != "responses":
+                    self.wfile.write(b"data: [DONE]\n\n")
+                    self.wfile.flush()
                 return
-            self._json({
+            resp = {
                 "id": "chatcmpl-0",
                 "model": req.get("model", "halogen-qwen3.8-flash-next"),
                 "choices": [{"index": 0, "message": {"role": "assistant", "content": "Hello from the stub."}}],
                 "usage": {"prompt_tokens": 7, "completion_tokens": 4},
-            })
+                # Lets the chunked-request test confirm the body survived.
+                "echo_req_len": len(raw),
+            }
+            if scenario == "upstream_timings":
+                resp["timings"] = {"prompt_n": 7, "predicted_n": 4,
+                                   "prompt_per_second": 111.0,
+                                   "predicted_per_second": 222.0}
+            self._json(resp)
 
     stub = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Stub)
     threading.Thread(target=stub.serve_forever, daemon=True).start()
@@ -566,6 +705,8 @@ def _selftest():
           chunk is not None and chunk.get("choices") == []
           and chunk.get("object") == "chat.completion.chunk"
           and chunk.get("id") and chunk.get("model"))
+    check("injected chunk created is epoch",
+          chunk is not None and chunk.get("created", 0) > 1_600_000_000)
 
     # Reasoning-heavy turns are the ones that used to report millions of
     # tok/s: thinking is generated but was not counted, so the decode window
@@ -585,6 +726,41 @@ def _selftest():
         rate = tc.get("timings", {}).get("predicted_per_second", 0) if tc else 0
         check(f"{scenario} predicted_per_second is sane",
               0 < rate < MAX_PLAUSIBLE_TPS)
+
+    # Upstream-supplied timings must win over the bridge's computed ones.
+    r = call("/v1/chat/completions", dict(payload, scenario="upstream_timings"))
+    obj = json.loads(r.read())
+    check("non-stream keeps upstream timings",
+          obj.get("timings", {}).get("predicted_per_second") == 222.0)
+
+    # The Responses API stream ends with response.completed and no [DONE];
+    # the bridge must still inject a timings chunk at EOF.
+    r = call("/v1/responses", dict(payload, stream=True, scenario="responses"))
+    raw = r.read().decode()
+    check("responses stream has no [DONE]", "data: [DONE]" not in raw)
+    tc = _timings_chunk(raw)
+    check("responses stream carries timings", tc is not None)
+    rate = tc.get("timings", {}).get("predicted_per_second", 0) if tc else 0
+    check("responses predicted_per_second is sane",
+          0 < rate < MAX_PLAUSIBLE_TPS)
+    check("responses timings ride its own completed event",
+          tc is not None and tc.get("type") == "response.completed"
+          and "choices" not in tc)
+
+    # A malformed usage block must not abort the stream.
+    r = call("/v1/chat/completions",
+             dict(payload, stream=True, scenario="bogus_usage"))
+    raw = r.read().decode()
+    check("bogus usage does not break stream", raw.rstrip().endswith("data: [DONE]"))
+    check("bogus usage still yields timings", _timings_chunk(raw) is not None)
+
+    # A chunked request body (no Content-Length) must reach the upstream.
+    chunk_body = json.dumps(dict(payload, scenario="echo")).encode()
+    c = HTTPConnection("127.0.0.1", port, timeout=10)
+    c.request("POST", "/v1/chat/completions", body=iter([chunk_body]),
+              headers={"Content-Type": "application/json"}, encode_chunked=True)
+    obj = json.loads(c.getresponse().read())
+    check("chunked request body forwarded", obj.get("echo_req_len") == len(chunk_body))
 
     r = call("/health")
     check("health passes through", r.status == 200 and r.read() == b"ok")
