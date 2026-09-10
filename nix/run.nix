@@ -46,8 +46,10 @@ let
     { name = "HALOGEN_QUEUE_TIMEOUT"; value = "3600"; }
   ];
 
+  # Image ENV as defaults: each baked var is exported but only when the caller
+  # did not already set it, which is how docker -e overrides image ENV.
   setDefaults = lib.concatMapStringsSep "\n"
-    (e: ''    export ${e.name}="${e.value}"'')
+    (e: ''    export ${e.name}="''${${e.name}-${e.value}}"'')
     bakedEnv;
 
   gpuBinds = ''
@@ -62,9 +64,8 @@ pkgs.writeScriptBin "halogen-server" ''
   ROOTFS="${rootfs}"
   unset LC_ALL 2>/dev/null || true
 
-  # Replicate the image's baked ENV: exported unconditionally, exactly as the
-  # image config sets it. Caller-set values for a var also named here are
-  # replaced, which is what docker -e does against image ENV.
+  # Replicate the image's baked ENV as defaults (not unconditional): a variable
+  # you set on the command line wins, like docker -e over image ENV.
   ${setDefaults}
 
   # The weights directory. The release image expects them at /models, mounted

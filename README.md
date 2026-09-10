@@ -923,20 +923,46 @@ the image's layers are fetched pinned from GHCR at build time and merged into a
 store rootfs — engine, OpenAI front-end and the llama-swap bridge — with no
 docker daemon involved).
 
+### How to run it
+
+Prerequisites: Nix with flakes (`nix.extraOptions.experimental-features = [
+"nix-command" "flakes" ]`). The first build pulls the pinned image blobs
+(~1 GB download, then store-cached). `bubblewrap` is pulled in automatically.
+
 ```bash
-nix build .#halogen-server   # the merged rootfs (flash_serve, serve_api.py,
-                             # llama-swap-bridge.py, ROCm libs) in the store
-nix run .                    # reproduce the container: bind the rootfs at /,
-                             # /models read-only (HALOGEN_MODELS), /dev/kfd,
-                             # /dev/dri, memlock unlimited, then
-                             # /usr/local/bin/entrypoint.sh all
+# 1. build the store rootfs (flash_serve, serve_api.py, llama-swap-bridge.py,
+#    ROCm libs), and the `nix run` wrapper:
+nix build .#halogen-server
+
+# 2. run it like the container. `nix run .` binds the rootfs at /, /models
+#    read-only, /dev/kfd + /dev/dri when present, the image's baked HALOGEN_*
+#    defaults and memlock=-1, then execs the image's own entrypoint (engine on
+#    8730, api on 8731, llama-swap bridge on 8732, on by default):
+nix run .                                   # weights expected at /models
+HALOGEN_MODELS=/path/to/weights nix run .   # point at your weights dir
+HALOGEN_API_PORT=9000 nix run .             # override baked defaults (=-style: any baked HALOGEN_* wins)
 ```
 
-`nix run .` ([`nix/run.nix`](nix/run.nix)) uses `bubblewrap` to replicate the
-container environment — rootfs at `/`, `/proc`/`/dev`, the weights at `/models`
-(read-only), the image's baked `HALOGEN_*` defaults, `memlock=-1` — then execs
-the image's own entrypoint. The llama-swap bridge is on by default (port
-8732), exactly as in the container.
+Without weights this reproduces the container exactly (same three-line
+"no checkpoint at /models/..." boot message, same exit code). With weights on
+a Strix Halo host it serves: `curl 127.0.0.1:8732/health`, then any
+OpenAI-compatible client (llama-swap, Codex, curl) against `:8732/v1`.
 
-After a CI publish bumps the fork image, refresh the pin with
-`./regenerate.sh` (or `./regenerate.sh --check` to verify without rewriting).
+Env notes: baked image variables (`HALOGEN_*`, `PORT`, etc.) are set as
+defaults only — set them on the command line to override, like docker `-e`.
+`HALOGEN_MODELS` points `nix run` at the weights directory (host path), the
+only host element besides the GPU devices.
+
+### Keeping the pin fresh
+
+After a CI publish bumps the fork image, refresh the pinned layers:
+
+```bash
+./regenerate.sh           # re-fetch manifest + blobs, rewrite nix/image.nix
+./regenerate.sh --check   # cheaper: verify the pin against the registry (no downloads)
+```
+
+Implementation: [`nix/fetchers.nix`](nix/fetchers.nix) (fixed-output layer
+fetches through an anonymous ghcr token + the whiteout-correct merge),
+[`nix/run.nix`](nix/run.nix) (the bubblewrap run wrapper), `nix/image.nix` (the
+generated pin).
