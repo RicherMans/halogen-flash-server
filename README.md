@@ -915,3 +915,28 @@ The engine is distributed under the terms in [LICENSE.md](LICENSE.md).
 Third-party components and their licenses are listed in
 [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md). Model weights are licensed
 separately by their original authors.
+
+## The fork image as a Nix package
+
+This fork also ships the serving stack as a Nix package (a docker → Nix port:
+the image's layers are fetched pinned from GHCR at build time and merged into a
+store rootfs — engine, OpenAI front-end and the llama-swap bridge — with no
+docker daemon involved).
+
+```bash
+nix build .#halogen-server   # the merged rootfs (flash_serve, serve_api.py,
+                             # llama-swap-bridge.py, ROCm libs) in the store
+nix run .                    # reproduce the container: bind the rootfs at /,
+                             # /models read-only (HALOGEN_MODELS), /dev/kfd,
+                             # /dev/dri, memlock unlimited, then
+                             # /usr/local/bin/entrypoint.sh all
+```
+
+`nix run .` ([`nix/run.nix`](nix/run.nix)) uses `bubblewrap` to replicate the
+container environment — rootfs at `/`, `/proc`/`/dev`, the weights at `/models`
+(read-only), the image's baked `HALOGEN_*` defaults, `memlock=-1` — then execs
+the image's own entrypoint. The llama-swap bridge is on by default (port
+8732), exactly as in the container.
+
+After a CI publish bumps the fork image, refresh the pin with
+`./regenerate.sh` (or `./regenerate.sh --check` to verify without rewriting).
