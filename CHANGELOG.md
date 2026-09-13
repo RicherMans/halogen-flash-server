@@ -1,5 +1,451 @@
 # Changelog
 
+## 0.6.3
+
+Engine only, one loop. No kernel change, no weight change, bitwise identical
+output (checked on a 32,768-token prefill and on a 1,068-token fixture), so
+every published prefill, decode and quality number is unmoved; the prefill
+rows are best-of-two and this changes the first pass only.
+
+### Fixed
+
+- **The first long prompt after a restart read the lookup table one row at a
+  time.** The model's 47.7 GiB n-gram table is read through the page cache,
+  never held in RAM, and on a 128 GB machine running this server there is
+  never enough cache left to hold all of it (about 13 GiB at the defaults),
+  so any prompt whose rows are not cached reads them from disk. Each row is
+  one 4 KB random read, and the engine issued them one after another and
+  waited for each: 28 MB/s on the reference machine's NVMe drive, a
+  32,768-token prompt paying 46 to 52 s on top of its usual 25 s with the
+  table evicted, and 13.5 s on top of an 8,192-token prompt's 7 s. On a
+  host with less RAM to spare the table is never cached, and every long
+  prompt paid that, at whatever the drive or its contention made one read
+  cost; that is the mechanism behind the minutes reported on #10 and #22
+  by [@mqtt-fan](https://github.com/mqtt-fan), whose watchdog then read the
+  silence as a wedge.
+
+  The rows are now read 64 at a time (`HALOGEN_NGRAM_GATHER_THREADS`, `1`
+  restores the old loop). Same bytes to the same places. Measured on the
+  reference machine with the table evicted before each run: the
+  32,768-token first prompt costs 1.3 s over its usual time instead of 46
+  to 52 (8 threads 7.3 s, 16 and 32 about 3 s, 64 1.3 s, 128 1.2 s); the
+  8,192-token one under half a second instead of 13.5. The health PING is
+  answered through the read as before. The `lookup table: ... took N s`
+  line now says how many threads read it.
+
+  What this does not change: a drive that tops out below 64 reads in
+  flight (SATA queues 32; a spinning disk is slow at any depth) gets that
+  drive's depth rather than one; decode is untouched (16 rows a token); and
+  the amount of the table that fits in cache is the same, so
+  `HALOGEN_KV_POOL_POSITIONS=262144` still leaves more of it resident.
+
+### Documentation
+
+- README: the cold-start cost is stated with the version that changed it, in
+  the pool section and in "If the server starts but crawls on long prompts";
+  `--bench-prefill` in the engine's harness prints each pass, so the
+  first-pass cost is a number in the log rather than something inferred.
+
+## 0.6.2
+
+Front-end only (`tools/serve_api.py`). No kernel change, no weight change, no
+change to any answer on a request that does not mention the placeholder, so
+every published prefill, decode and quality number is unmoved.
+
+### Fixed
+
+- **A conversation that mentioned `<|image_pad|>` was unservable.** Reported
+  with a precise repro and the mechanism by
+  [@Syakyr](https://github.com/Syakyr) (#39). The tokenizer parses its added
+  tokens out of ordinary text, so the thirteen characters `<|image_pad|>`
+  typed by a user (a pasted log, a quoted traceback, a bug report about this
+  server) or printed by the model became the same special id the chat
+  template writes for an image, and the engine's 0.5.8 check refused it as a
+  placeholder with no image behind it. The next turn re-tokenizes the
+  history, so one mention by either side made every later turn a 400 and the
+  only recovery was a new session with the string rewritten. 0.5.8's
+  changelog called that path "the same defect"; it is not, and the reporter
+  is right that a mention has to be servable as text.
+
+  The API now sends a mentioned placeholder as the ordinary tokens of its
+  spelling (`<`, `|`, `image`, `_pad`, `|`, `>`), decided on the token ids
+  after the template runs, so the model reads exactly the characters that
+  were written and the engine never sees an uncovered placeholder. The
+  template's own placeholder is told apart by the `<|vision_start|>` and
+  `<|vision_end|>` it is always written between when the request carries an
+  image; with no image on the request every placeholder is a mention.
+  `<|video_pad|>` in text is text the same way. Applies to
+  `/v1/chat/completions`, `/v1/responses` and `/v1/completions`. Every
+  request without a mention sends the same ids it did before, checked on the
+  gate. The engine's refusal (0.5.8) is unchanged; from this API it is now
+  reachable only by typing the whole
+  `<|vision_start|><|image_pad|><|vision_end|>` sequence in a request that
+  also attaches an image, which is refused with a message naming both counts.
+
+  A `video` content part is now refused by the API before the template runs
+  (this server has no video path); it used to reach the engine and be
+  refused there, after the stream had started.
+
+- **An error after a streaming response had started cut the connection.**
+  The second half of #39. The engine's refusal, and the first-token and
+  mid-decode timeouts, were raised after the SSE headers had gone out, so
+  the client saw a dropped stream and the log Starlette's
+  `Caught handled exception, but response already started`. A streaming
+  request now ends with its wire's own error: on `/v1/chat/completions` and
+  `/v1/completions` a `data: {"error": {...}}` frame followed by
+  `data: [DONE]` (what the OpenAI SDKs raise as an `APIError`), on
+  `/v1/responses` an `error` event. The log gets one line with the reason.
+  Non-streaming requests still get the 400 they always did.
+
+- **The prompt cache's snapshot point could drift on a conversation with
+  images.** Found while fixing the above: the API added an image's token
+  growth to the snapshot point once per token it walked past the shifted
+  value, not once. Unreachable in practice for an image (its growth outruns
+  the few tokens that follow the history point) and reachable for a
+  mention's five; both passes now read the original points. No served
+  number moved.
+
+## 0.6.1
+
+Serving surface and startup legibility. No kernel change, no weight change, no
+change to any answer, so every published prefill, decode and quality number is
+unmoved.
+
+### Fixed
+
+- **Tool-call arguments were flushed as one burst, and Node clients hung up on
+  the long ones.** Reported with a raw-client measurement by
+  [@smazurov](https://github.com/smazurov) (#36) and, from the client side,
+  by [@iTechMedic](https://github.com/iTechMedic) (#3), who showed every
+  failing client was Node/undici, every passing one was not, and that
+  re-chunking the identical bytes through a proxy removed every failure. The
+  streaming splitter emitted nothing about a call until its closing tag
+  arrived, so a 150-character command was 1.4 s of silence and a file-writing
+  call was minutes, which is undici's 300 s inactivity timer with no client
+  setting to change it.
+
+  A call's id and name now go out as soon as the function tag closes, a
+  string parameter streams as it is written (JSON-escaped in pieces, and the
+  pieces concatenate byte for byte to what a non-streaming request returns),
+  and a non-string parameter goes out when its value closes, because the wire
+  carries values untyped. On the gate, the report's `bash` command is 43
+  argument frames spread over the value's generation instead of 3 at its end.
+  A call cut off by `max_tokens` now leaves its partial arguments on the wire
+  with `finish_reason: "length"`, as OpenAI does.
+
+  Separately, a streaming response now sends an SSE comment line
+  (`: keepalive`) whenever nothing else has gone out for 10 s
+  (`HALOGEN_SSE_KEEPALIVE_S`, 0 disables). SSE parsers ignore comment lines
+  and every HTTP client's inactivity timer resets on one. This also covers a
+  long prefill, which sends nothing before its first token. The
+  client-disconnected log line now ends with the largest gap between frames,
+  the age of the last frame at the hangup, and the keepalive count.
+
+- **The `developer` role was refused with a 400.** Reported by
+  [@felladrin](https://github.com/felladrin) (#32), confirmed by
+  [@k4ss4n](https://github.com/k4ss4n). OpenAI clients send it for reasoning
+  models; pi does for every model it marks as one. It maps to `system` before
+  the template runs, on `/v1/chat/completions` as it already did on
+  `/v1/responses`.
+
+- **Four `/cache` fields were placeholders.** Found while answering
+  [@carrot-root-ai](https://github.com/carrot-root-ai) (#31). `entries`,
+  `evicted`, `cap_bytes` and `reserved_bytes` were stand-ins from when the
+  cache held one entry and were never updated for the eight-entry cache, so a
+  two-prompt run read `entries: 1, evicted: 3`. `entries` and `evicted` are
+  real now; `cap_bytes` and `reserved_bytes` are replaced by `max_entries`
+  and `last_entry_bytes`, and `bytes` is what is resident for the live
+  entries. The counters that were already right (`hits`, `misses`, `stores`,
+  the timings) are unchanged.
+
+### Added
+
+- **`HALOGEN_ENABLE_THINKING`**, the ninth request default, alongside the
+  eight from 0.5.9. `0` renders every request that does not say otherwise
+  without the thinking block; a request that sends `enable_thinking` wins.
+  `/v1/responses` has no such field, so this is the only way to run that
+  route without thinking.
+
+- **A reservation that runs long says why while it runs.** Reported by
+  [@felladrin](https://github.com/felladrin) (#33), who watched
+  `still loading, 300s elapsed` five times on the KV pool step and could not
+  tell a slow disk from a machine that would never finish. Every 30 s
+  (`HALOGEN_RESERVE_TICK_S`) during the working-memory and KV-pool
+  reservations the engine now prints the free contiguous 2 MiB block count
+  and the compaction stalls since the reservations began. Stalls climbing
+  means the kernel is compacting host memory, which finishes on its own. The
+  pool is not sized against the block count, and the report's own log shows
+  why that would not have helped: 16.6 GiB was contiguous two lines before a
+  7.2 GiB pool stalled, and the 21 GiB working reservation between them took
+  it.
+
+### Changed
+
+- **`seccomp:unconfined` is gone** from the compose file and both run
+  commands. Suggested by [@rcmorano](https://github.com/rcmorano) (#8) and
+  measured: the image starts and serves without it under Podman, and the
+  reporter runs Docker without it. `ipc: host` stays; the compose file now
+  says why beside it (the GPU runtime dies in 2 s without it, and no
+  `shm_size` substitutes). If a Docker install breaks on the default profile,
+  the line comes back and this file will say so.
+
+- **The published 0.6.0 source tree lagged the 0.6.0 image on
+  `deploy/entrypoint.sh`.** The image's entrypoint checks whether the quality
+  sidecar on disk predates 0.6.0 (no draft-head entries), fetches just that
+  2.4 GiB file when `HALOGEN_DOWNLOAD` is set and the volume is writable, and
+  otherwise says what is missing; the tree published with 0.6.0 did not carry
+  that change. It does now, and the README's note on the models volume says
+  when a start re-fetches.
+
+### Documentation
+
+- The three kernel flags the README lists for completeness
+  (`amdgpu.vm_update_mode=0`, `amdgpu.noretry=0`, `amdgpu.sg_display=0`) now
+  say they are unmeasured in both directions and cite
+  [@felladrin](https://github.com/felladrin)'s report (#34) of an amdgpu
+  deadlock on a boot that had the first two set: one machine, one occurrence,
+  not isolated to either flag.
+
+## 0.6.0
+
+Faster decode on the traffic an agent produces, and a better draft head. No
+kernel change and no change to any answer: at temperature 0 every token is
+still the model's own greedy choice, verified on every release, and the
+sidecar's 723 existing tensors are byte-identical to 0.5.x's.
+
+### Added
+
+- **Prompt lookup beside the MTP head.** When the last three tokens of the
+  answer already occur earlier in the request's own context (the prompt or
+  what it has generated so far), the three tokens that followed that earlier
+  occurrence are proposed as one chain and verified in a single step, and the
+  head's own draft has to open the chain. Nothing is drafted by a model, so it
+  costs nothing where an answer is new text and pays where it repeats its
+  context, which is most of what a coding agent's turn is: tool-call
+  arguments, file paths, code that quotes the file being edited. Measured on
+  the engine, thinking off, coding-agent turns (SWE-agent trajectories cut at
+  an assistant turn, six prompts, 400 tokens each): **49.1 tok/s with the head
+  alone, 56.3 with prompt lookup beside it (+15%)**, serial 36.8; on
+  function-calling turns (Hermes, six prompts) 48.8 to 53.1 (+9%). With thinking on,
+  the served default: 49.2 to 55.7 on the same SWE prompts (+13%), because
+  this model's reasoning quotes the task and the file. Prose and code text are
+  unchanged within noise. Greedy requests only; a sampled request uses the
+  head alone; like the head it drafts while the request is the only one
+  generating, and the concurrency rows are unchanged (2 streams 56.5 and 4
+  streams 77.1 tokens/s total on this image, every stream byte-identical to
+  alone). `HALOGEN_PLD=0` turns it off. Every one of those runs produced the
+  serial run's tokens exactly.
+
+- **The MTP head's own projections at 8 bits**, in the sidecar. The head had
+  shipped at the base file's 4-bit rounding since 0.1.0 and nobody had
+  measured what that cost, because there was no other head to compare it with.
+  At 8 bits its drafts are accepted 59% of the time on prose against 51%,
+  which is about 4% of decode on prose (43.1 to 44.8 tok/s at 1,500 tokens of
+  context) and within noise on code. The sidecar grows by 0.09 GiB (2.31 to
+  2.40 GiB); its existing 723 tensors are unchanged byte for byte, so
+  `HALOGEN_CK_OVERLAY` and the speed arm behave as before. An older image
+  reads the new file and gains the same.
+
+- The per-request log line ends with the prompt-lookup rounds (`pld N
+  rounds, X acc/round`), the engine's `D` line carries them as two trailing
+  fields, and `/health` reports `prompt_lookup`. The image's own `bench` over
+  its ten prompt shapes reads 45.3 tok/s mean with speculation (43.6 on
+  0.3.0, the same instrument).
+
+### Changed
+
+- The speculative verify reserves 4 rows instead of 2 (about 0.2 GiB of device
+  memory), so a three-token chain fits; the KV-pool fit accounts for it.
+
+## 0.5.9
+
+Server-side defaults for the fields a request leaves out, and two things the
+log now says that it could not before. No kernel change, no weight change, no
+numeric change on any path a request took before: every published prefill,
+decode and quality number is unmoved.
+
+### Added
+
+- **Server-side defaults for sampling, the token budget, and reasoning
+  effort.** Asked for by [@Mushoz](https://github.com/Mushoz) (#30).
+  `HALOGEN_TEMPERATURE`, `HALOGEN_TOP_P`, `HALOGEN_TOP_K`, `HALOGEN_MIN_P`,
+  `HALOGEN_PRESENCE_PENALTY`, `HALOGEN_FREQUENCY_PENALTY`,
+  `HALOGEN_MAX_TOKENS_DEFAULT` and `HALOGEN_REASONING_EFFORT` each set the
+  value a request gets when it omits that field, on all three routes. A field
+  the request sends always wins; a default fills only a field the request
+  omits; a request that sends `temperature: 0` decodes greedy and takes none
+  of the sampling defaults. A value outside its range refuses to start,
+  before the model loads, naming the variable. `/health` reports what is set
+  under `server_defaults` and says which path a temperature-less request
+  takes. The image's own default is unchanged (greedy); the README now gives
+  the model card's settings as the three `-e` lines that switch to them.
+
+### Fixed
+
+- **The engine answers its health check while it reads the lookup table.**
+  Reported by [@mqtt-fan](https://github.com/mqtt-fan) (#10, #22). Reading
+  the model's 47.7 GiB lookup table at the start of a prefill was the one
+  step that could not answer the container's PING. On a host with too little
+  RAM left for the table's file cache that read runs for minutes, and the
+  watchdog took a working server down as a wedge, twice, while the same host
+  with the watchdog off finished every request. The read now answers PING on
+  the same cadence as the rest of a prefill, prints `lookup table: ... took
+  N s` when it runs long, and the watchdog's message says what the code
+  guarantees. The startup pre-flight warns when 10 GiB or more of host RAM
+  is already in use before the engine starts, which is the condition. The
+  slowness itself is the host's memory, not the engine, and is not changed.
+
+- **`commit N/round` in the request log counted tokens the request produced
+  beside other streams.** Same reporter (#22), and the same shape in #3. A
+  request alone for one speculative round and then sharing the engine for
+  189 tokens printed `1 rounds, commit 190.00/round`, which read as a decode
+  defect and was not one. The ratio is now over the speculative rounds'
+  tokens only (healthy is 1.6 to 1.8), and the line ends with `N tok beside
+  other streams` when any were.
+
+### Documentation
+
+- The README's Sampling section gives the model card's recommended settings
+  and how to make them the server's default; the budget section explains why
+  the default budget is a concurrency decision on a 128 GB host.
+
+## 0.5.8
+
+One engine check that can only refuse, and a version that can be read from
+inside the container. No kernel change, no weight change, no numeric change:
+every request the engine served before is served identically, so every
+published prefill, decode and quality number is unmoved.
+
+### Fixed
+
+- **An image placeholder with no image behind it was answered as if there
+  were one.** Reported by [@jtnishi](https://github.com/jtnishi) (#26). Their
+  compose file ran the `api` container at 0.4.4 and the `engine` at 0.5.6.
+  That front-end predates image support: it rendered the chat template's
+  `<|vision_start|><|image_pad|><|vision_end|>` for the image part and never
+  decoded or sent the pixels. The engine then prefilled the placeholder's
+  ordinary embedding, and the model, which has learned that an image lives at
+  that token, described one. The result was a fluent, confident, different
+  picture every run, unaffected by temperature, with nothing anywhere saying
+  a thing had gone wrong. Reproduced here against one engine: 60 prompt tokens
+  through the 0.4.4 front-end against 2,559 through the current one, for the
+  same image.
+
+  The engine now refuses any prompt in which a placeholder token is not
+  covered by an attached image, naming the token position and the likely
+  cause, and the same goes for a video placeholder (this server has no video
+  path) and for an image declared over a token that is not a placeholder.
+  The check runs once over the prompt ids at admission and can only refuse,
+  so an accepted request is untouched. It also closes a path that was open
+  from any client at any version: a user message whose text contains the
+  literal string `<|image_pad|>` reached the engine the same way, and was
+  answered the same way.
+
+- **The engine's reason for refusing a request now reaches the client.**
+  Until now it went only to the engine's log, and the front-end's `400` had to
+  guess (the old text blamed prompt length). The reason rides the internal
+  protocol after the fixed fields, and the front-end repeats it verbatim:
+  `the engine refused this request: prompt token 38 is the image placeholder
+  <|image_pad|> and no image covers it: ...`.
+
+### Added
+
+- **Each container says which release it is, and the front-end compares.**
+  Nothing running inside the image could read the version label, so neither
+  log in #26 printed one and `/health` had none to show; a careful reporter
+  posting both logs could not see that they disagreed. The first line of every
+  mode is now `halogen: halogen-flash-server 0.5.8, mode api`, the front-end
+  prints its own version beside the engine's at startup and prints a
+  `WARNING` when they differ, and `/health` carries
+  `version: {"api": ..., "engine": ..., "match": ...}`. A mismatch is a warning
+  and not a refusal, because a split across a patch release is harmless and
+  refusing it would break a working install; the engine-side check above is
+  what turns the harmful case into an error.
+
+### Documentation
+
+- The compose file and the README now say it in one place: **both services
+  run the same image tag.** When you bump one, bump the other.
+
+## 0.5.7
+
+Front-end only. No engine change, no kernel change, no weight change, so every
+published prefill, decode and quality number is unmoved.
+
+### Fixed
+
+- **An idle connection was closed after five seconds, and the next request on
+  it failed.** Reported by [@iTechMedic](https://github.com/iTechMedic) (#25).
+  The server never set uvicorn's keep-alive timeout, so it ran at the framework
+  default of 5 s on every release ever shipped. An agent idles between turns for
+  as long as a tool call, a file write, or a person reading the last answer
+  takes, and because `POST` is not idempotent most HTTP clients will not quietly
+  retry on a fresh socket the way they would for a `GET`. The failure therefore
+  reached the user as a socket error partway through a long session.
+
+  The default is now 300 s, and `HALOGEN_KEEPALIVE_TIMEOUT` sets it. An idle
+  connection costs a file descriptor and holds no conversation slot, so there is
+  no reason for it to be short. The race is inherent to HTTP keep-alive, since a
+  server may close at the moment a client writes, so a client that pools
+  connections should still retry a reused socket; what the old default did was
+  turn a rare race into a constant one.
+
+  The report is worth reading for its method. The first reproduction idled 6, 30
+  and 90 seconds between reuses, all above the threshold, which a server closing
+  after *every* response would have matched exactly. Asked for a control, they
+  added back-to-back reuse at zero idle and then bracketed the boundary to
+  between 4 s and 5 s.
+
+- **`chat_template_kwargs` was accepted and silently ignored.** Reported by
+  [@nortejiang-tech](https://github.com/nortejiang-tech) (#24). vLLM and SGLang
+  take the template controls nested, as
+  `chat_template_kwargs: {"enable_thinking": false}`, and that is what most
+  agentic clients send because that is what they were written against. This
+  server declared those controls only as top-level fields, so the nested form
+  was discarded with no warning and no log line: a caller who asked for thinking
+  off got a `200` with thinking on.
+
+  Both spellings now reach the same three controls: `reasoning_effort`,
+  `enable_thinking` and `preserve_thinking`. Sending a control both ways is fine
+  when the values agree and a `400` when they disagree, and an unsupported key
+  inside `chat_template_kwargs` is a `400` naming the keys that work rather than
+  a silent drop.
+
+### Added
+
+- **`/health` says what the token budget is spent on.** Raised by
+  [@tretyakevich](https://github.com/tretyakevich) (#21) and
+  [@nortejiang-tech](https://github.com/nortejiang-tech) (#24). `max_tokens`
+  bounds reasoning and content together, and with no `reasoning_effort` sent the
+  chat template's own default is `xhigh`. On a long agentic prompt that can
+  consume the entire budget before the model closes its thinking block, and the
+  caller then receives an empty `content`, the whole reply in
+  `reasoning_content`, and `finish_reason: "length"`. At least one agent harness
+  reads that as "the model returned no assistant message" and retries, which is
+  deterministic at temperature 0 and so repeats exactly.
+
+  None of that was discoverable. `/health` advertised `max_tokens_default` and
+  said nothing about what consumes it. It now reports
+  `reasoning_effort_default`, `reasoning_effort_values`,
+  `token_budget_covers_reasoning` and `chat_template_kwargs` beside it. To turn
+  reasoning off entirely, send `enable_thinking: false`; `reasoning_effort:
+  "minimal"` is an alias for the template's `low`, which still reasons.
+
+- **A client that hangs up mid-stream now says so in the log.** Raised by
+  [@iTechMedic](https://github.com/iTechMedic) while diagnosing #3, which stays
+  open. Until now a hangup and a clean finish produced identical output: uvicorn
+  logs `200 OK` either way, because the status went out with the headers long
+  before, and the per-request summary never printed because the generator was
+  cancelled before it could emit one. The entire server-side trace of an
+  abandoned stream was a bare access line indistinguishable from success.
+
+  That is a hole in the log, and a hole in a log gets filled by someone's
+  inference: the reporter reasoned from the absence of our own timeout message
+  that the engine had stalled, and the silence was ours. There is now one line
+  on the disconnect path, naming the response id, the frames and characters
+  already sent, and the elapsed time. A disconnect is a normal event rather than
+  an error, so it is a line and not a traceback.
+
 ## 0.5.6
 
 ### Fixed
